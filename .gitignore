@@ -1,0 +1,23 @@
+# Секреты — никогда не коммитим!
+.env
+
+# Бинарники Go
+*.exe
+*.out
+bin/
+
+# Кэш Go
+vendor/
+
+# IDE файлы
+.idea/
+.vscode/
+*.swp
+
+# OS файлы
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+dist/
