@@ -1,0 +1,46 @@
+# =============================================================================
+# DTrader 6 — Bot Service Configuration
+# =============================================================================
+
+# Настройки приложения
+app:
+  name: dtrader-6-bot
+  env: development         # development | production
+
+# Настройки биржи Gate.io
+exchange:
+  name: gate.io
+  ws_url: wss://fx-ws.gateio.ws/v4/ws/usdt          # USDT Perpetual Futures
+  ws_testnet_url: wss://fx-ws-testnet.gateio.ws/v4/ws/usdt  # Testnet
+  rest_url: https://api.gateio.ws/api/v4
+  reconnect_interval: 5s   # пауза перед переподключением при разрыве
+  ping_interval: 10s        # интервал ping/pong для поддержания соединения
+
+# Торгуемые пары (USDT Perpetual Futures)
+symbols:
+  - BTC_USDT
+  - ETH_USDT
+  - SOL_USDT
+
+# Таймфреймы
+timeframes:
+  ltf: "1m"  # сырые свечи с биржи
+  mtf: 8     # агрегируем каждые 8 свечей 1m → 8m
+  htf: 3     # агрегируем каждые 3 свечи 8m → 24m
+
+# Стакан ордеров
+orderbook:
+  depth: 20  # максимальная глубина стакана (levels)
+
+# Настройки Redis
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+
+# Размеры скользящих окон хранения данных в Redis
+storage:
+  candles_1m:  200   # последние 200 свечей 1m  (~3 часа)
+  candles_8m:  100   # последние 100 свечей 8m  (~13 часов)
+  candles_24m: 50    # последние 50  свечей 24m (~50 дней)
+  trades:      1000  # последние 1000 тиков на символ
