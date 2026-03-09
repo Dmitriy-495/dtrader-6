@@ -1,6 +1,3 @@
-// ws.go — WebSocket соединение с Gate.io.
-// Отвечает за: коннект, ping/pong, reconnect.
-// Подписки на данные — в subscribe.go (следующий шаг).
 package gateway
 
 import (
@@ -8,55 +5,59 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/utils"
 )
 
-// WSMessage — универсальная структура сообщения Gate.io WebSocket.
-// Gate.io использует один формат для всех сообщений: ping, pong, подписки, данные.
-type WSMessage struct {
-	// Time — Unix timestamp сообщения
-	Time    int64  `json:"time"`
-	// Channel — канал: "futures.ping", "futures.pong", "futures.candlesticks" и т.д.
-	Channel string `json:"channel"`
-	// Event — тип события: "subscribe", "unsubscribe", "update", "all"
-	Event   string `json:"event,omitempty"`
-	// Error — ошибка от биржи если что-то пошло не так
-	Error   *WSError `json:"error,omitempty"`
+type WSRequest struct {
+	Time    int64    `json:"time"`
+	Channel string   `json:"channel"`
+	Event   string   `json:"event,omitempty"`
+	Payload []string `json:"payload,omitempty"`
 }
 
-// WSError — структура ошибки от Gate.io WebSocket.
+type WSResponse struct {
+	Time    int64           `json:"time"`
+	Channel string          `json:"channel"`
+	Event   string          `json:"event,omitempty"`
+	Error   *WSError        `json:"error,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+}
+
 type WSError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-// WSClient — WebSocket клиент Gate.io.
 type WSClient struct {
-	// url — WebSocket URL биржи
-	url    string
-	// apiKey и secret — для авторизованных подписок (ордера, позиции)
-	apiKey string
-	secret string
-	// conn — активное WS соединение (nil если не подключены)
-	conn   *websocket.Conn
+	url     string
+	apiKey  string
+	secret  string
+	conn    *websocket.Conn
+	writeMu sync.Mutex
 }
 
-// NewWSClient создаёт новый WebSocket клиент.
 func NewWSClient(url, apiKey, secret string) *WSClient {
-	return &WSClient{
-		url:    url,
-		apiKey: apiKey,
-		secret: secret,
-	}
+	return &WSClient{url: url, apiKey: apiKey, secret: secret}
 }
 
-// Connect устанавливает WebSocket соединение с Gate.io.
+func (c *WSClient) writeJSON(v interface{}) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.WriteJSON(v)
+}
+
+func (c *WSClient) writeMessage(messageType int, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.WriteMessage(messageType, data)
+}
+
 func (c *WSClient) Connect(ctx context.Context) error {
-	dialer := websocket.DefaultDialer
-	conn, _, err := dialer.DialContext(ctx, c.url, nil)
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.url, nil)
 	if err != nil {
 		return fmt.Errorf("WS коннект не удался: %w", err)
 	}
@@ -65,38 +66,29 @@ func (c *WSClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-// sendPing отправляет ping сообщение на Gate.io.
-// Gate.io требует ping каждые ~10 секунд иначе закрывает соединение.
 func (c *WSClient) sendPing() error {
-	msg := WSMessage{
+	return c.writeJSON(WSRequest{
 		Time:    utils.NowUnix(),
 		Channel: "futures.ping",
-	}
-	return c.conn.WriteJSON(msg)
+	})
 }
 
-// RunPingLoop запускает цикл ping/pong — держит соединение живым.
-// Блокирующий вызов — запускать в горутине: go client.RunPingLoop(ctx)
-//
-// Завершается когда:
-//   - ctx отменён (штатное завершение)
-//   - соединение разорвано (ошибка записи)
 func (c *WSClient) RunPingLoop(ctx context.Context) {
-	// Тикер срабатывает каждые 10 секунд.
-	ticker := time.NewTicker(10 * time.Second)
-	// defer Stop() — освобождаем тикер при выходе из функции.
-	defer ticker.Stop()
+	if err := c.sendPing(); err != nil {
+		log.Printf("❌ Первый ping не удался: %v", err)
+		return
+	}
+	log.Printf("🏓 Первый ping отправлен [%d]", utils.NowUnix())
 
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 	log.Println("🏓 Ping loop запущен")
 
 	for {
 		select {
-		// ctx.Done() — контекст отменён, завершаем loop.
 		case <-ctx.Done():
 			log.Println("🛑 Ping loop остановлен")
 			return
-
-		// ticker.C — канал тикера, срабатывает каждые 10 секунд.
 		case <-ticker.C:
 			if err := c.sendPing(); err != nil {
 				log.Printf("❌ Ошибка ping: %v", err)
@@ -107,49 +99,109 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 	}
 }
 
-// ReadLoop читает входящие сообщения от Gate.io.
-// Блокирующий вызов — запускать в горутине: go client.ReadLoop(ctx)
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	log.Println("👂 Read loop запущен")
 
+	// Счётчики сообщений по каждому каналу.
+	// Используем для двух целей:
+	// 1. Прореживание лога — не спамим терминал
+	// 2. Статистика — видим что данные реально идут
+	var obCount, tradeCount, candleCount, totalCount int
+
+	// Каждые 5 секунд печатаем сколько сообщений получили.
+	// Так мы ВСЕГДА видим что бот живой даже если данные не логируются.
+	statTicker := time.NewTicker(5 * time.Second)
+	defer statTicker.Stop()
+
 	for {
-		// Проверяем контекст перед каждым чтением.
+		// Неблокирующая проверка тикера статистики.
 		select {
-		case <-ctx.Done():
-			log.Println("🛑 Read loop остановлен")
-			return
+		case <-statTicker.C:
+			log.Printf("📊 Статистика: всего=%d | стакан=%d | тики=%d | свечи=%d",
+				totalCount, obCount, tradeCount, candleCount)
 		default:
 		}
 
-		// Читаем следующее сообщение от биржи.
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
-			log.Printf("❌ Ошибка чтения WS: %v", err)
+			if ctx.Err() != nil {
+				log.Println("🛑 Read loop остановлен")
+				return
+			}
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Println("🔌 WS закрыт биржей штатно")
+				return
+			}
+			log.Printf("❌ WS ошибка: %v", err)
 			return
 		}
 
-		// Парсим JSON в WSMessage.
-		var msg WSMessage
+		totalCount++
+
+		var msg WSResponse
 		if err := json.Unmarshal(raw, &msg); err != nil {
-			log.Printf("⚠️ Не удалось разобрать сообщение: %s", string(raw))
+			log.Printf("⚠️ Не удалось разобрать: %s", string(raw))
 			continue
 		}
 
-		// Обрабатываем pong — подтверждение нашего ping.
 		if msg.Channel == "futures.pong" {
 			log.Printf("🏓 Pong получен [%d]", msg.Time)
 			continue
 		}
 
-		// Остальные сообщения — логируем пока без обработки.
-		// TODO: роутинг по msg.Channel в subscribe.go
-		log.Printf("📨 Сообщение: channel=%s event=%s", msg.Channel, msg.Event)
+		if msg.Error != nil {
+			log.Printf("❌ Ошибка биржи: code=%d msg=%s channel=%s",
+				msg.Error.Code, msg.Error.Message, msg.Channel)
+			continue
+		}
+
+		if msg.Event == "subscribe" {
+			log.Printf("✅ Подписка подтверждена: channel=%s", msg.Channel)
+			continue
+		}
+
+		switch msg.Channel {
+
+		case "futures.order_book":
+			obCount++
+			// Каждое 100-е сообщение стакана
+			if obCount%100 == 0 {
+				preview := string(raw)
+				if len(preview) > 100 {
+					preview = preview[:100] + "..."
+				}
+				log.Printf("📖 [%d] %s", obCount, preview)
+			}
+
+		case "futures.trades":
+			tradeCount++
+			// Каждый 20-й тик
+			if tradeCount%20 == 0 {
+				preview := string(raw)
+				if len(preview) > 100 {
+					preview = preview[:100] + "..."
+				}
+				log.Printf("💹 [%d] %s", tradeCount, preview)
+			}
+
+		case "futures.candlesticks":
+			candleCount++
+			// Все свечи — их мало
+			preview := string(raw)
+			if len(preview) > 100 {
+				preview = preview[:100] + "..."
+			}
+			log.Printf("🕯️ [%d] %s", candleCount, preview)
+		}
 	}
 }
 
-// Close закрывает WebSocket соединение.
 func (c *WSClient) Close() {
 	if c.conn != nil {
+		c.writeMessage(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		)
 		c.conn.Close()
 		log.Println("🔌 WS соединение закрыто")
 	}
