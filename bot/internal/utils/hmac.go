@@ -94,6 +94,7 @@ func SignREST(secret, method, path, query, body string, timestamp int64) string 
 //   - timestamp : текущее время в секундах Unix (int64)
 //
 // Возвращает hex строку подписи которую нужно передать в поле auth.SIGN.
+// TODO: используется в gateway/ws.go (WebSocket авторизация)
 func SignWS(secret, channel, event string, timestamp int64) string {
 	// Формируем signature_string для WebSocket.
 	// Формат отличается от REST — нет метода, пути и хэша тела.

@@ -1,71 +1,45 @@
 // Пакет config отвечает за загрузку и хранение всей конфигурации бота.
-// Он читает config.yaml (основные настройки) и .env (секреты)
-// и собирает их в единую структуру Config.
+// Читает config.yaml (основные настройки) и .env (секреты),
+// собирает всё в единую структуру Config.
 package config
 
 import (
-	// os — работа с операционной системой: чтение переменных окружения,
-	// открытие файлов и т.д.
+	"fmt"
 	"os"
 
-	// fmt — форматирование строк и ошибок
-	"fmt"
-
-	// godotenv — загружает .env файл в переменные окружения (os.Getenv)
 	"github.com/joho/godotenv"
-
-	// yaml — разбирает YAML файл и заполняет Go структуры
 	"go.yaml.in/yaml/v3"
 )
-
-// =============================================================================
-// СТРУКТУРЫ КОНФИГУРАЦИИ
-// Каждая структура зеркалит соответствующую секцию config.yaml.
-// Тег `yaml:"name"` говорит парсеру какое поле YAML соответствует
-// этому полю структуры.
-// =============================================================================
 
 // AppConfig — секция app: в config.yaml
 type AppConfig struct {
 	// Name — имя сервиса, используется в логах
 	Name string `yaml:"name"`
-
-	// Env — окружение: development или production.
-	// В development включаем подробные логи, в production — краткие.
+	// Env — окружение: development | production
 	Env string `yaml:"env"`
 }
 
 // ExchangeConfig — секция exchange: в config.yaml
 type ExchangeConfig struct {
-	// Name — название биржи, используется в логах
+	// Name — название биржи
 	Name string `yaml:"name"`
-
-	// WsURL — WebSocket URL для боевого подключения к Gate.io
-	// USDT Perpetual Futures: wss://fx-ws.gateio.ws/v4/ws/usdt
+	// WsURL — WebSocket URL USDT Perpetual Futures
 	WsURL string `yaml:"ws_url"`
-
-	// WsTestnetURL — WebSocket URL тестовой сети Gate.io.
-	// Используем для разработки чтобы не трогать реальные данные.
+	// WsTestnetURL — WebSocket URL тестовой сети
 	WsTestnetURL string `yaml:"ws_testnet_url"`
-
-	// RestURL — базовый URL REST API Gate.io.
-	// Используется для получения начальных исторических данных.
+	// RestURL — базовый URL REST API
 	RestURL string `yaml:"rest_url"`
-
-	// ReconnectInterval — пауза перед переподключением при разрыве WS соединения.
-	// Тип string потому что YAML хранит "5s", а Go time.Duration
-	// мы получим через парсинг в методе Load().
+	// ReconnectInterval — пауза перед переподключением при разрыве WS.
+	// TODO: распарсить в time.Duration при реализации gateway/ws.go
 	ReconnectInterval string `yaml:"reconnect_interval"`
-
-	// PingInterval — интервал отправки ping сообщений бирже.
-	// Gate.io требует ping каждые 10 секунд иначе закрывает соединение.
+	// PingInterval — интервал ping/pong для поддержания WS соединения.
+	// TODO: распарсить в time.Duration при реализации gateway/ws.go
 	PingInterval string `yaml:"ping_interval"`
 }
 
 // OrderbookConfig — секция orderbook: в config.yaml
 type OrderbookConfig struct {
-	// Depth — глубина стакана (количество уровней bid и ask).
-	// Мы используем 20 уровней для расчёта давления в стакане в LTF Sniper.
+	// Depth — глубина стакана (количество уровней bid и ask)
 	Depth int `yaml:"depth"`
 }
 
@@ -73,139 +47,110 @@ type OrderbookConfig struct {
 type RedisConfig struct {
 	// Host — адрес Redis сервера
 	Host string `yaml:"host"`
-
 	// Port — порт Redis сервера (по умолчанию 6379)
 	Port int `yaml:"port"`
-
-	// DB — номер базы данных Redis (0-15).
-	// Используем 0 для бота.
+	// DB — номер базы данных Redis (0-15)
 	DB int `yaml:"db"`
-
-	// Password — пароль Redis.
-	// НЕ берётся из config.yaml — загружается из .env
-	// через переменную окружения REDIS_PASSWORD.
-	Password string // без тега yaml — заполняется из .env
+	// Password — загружается из .env (REDIS_PASSWORD), не из yaml
+	Password string
 }
 
 // StorageConfig — секция storage: в config.yaml
-// Определяет размеры скользящих окон данных в Redis.
-// После достижения лимита старые данные автоматически удаляются (LTRIM).
+// Определяет размеры скользящих окон данных в Redis (LTRIM).
 type StorageConfig struct {
-	// Candles1m — количество хранимых 1m свечей на символ.
-	// 200 свечей = ~3 часа истории.
+	// Candles1m — количество хранимых 1m свечей (~3 часа при 200 свечах)
 	Candles1m int `yaml:"candles_1m"`
-
-	// Trades — количество хранимых тиков на символ.
-	// 1000 тиков достаточно для LTF Sniper анализа.
+	// Trades — количество хранимых тиков на символ
 	Trades int `yaml:"trades"`
 }
 
-// Config — главная структура конфигурации.
-// Объединяет все секции config.yaml и секреты из .env.
-// Именно этот тип мы передаём во все модули бота.
-type Config struct {
-	// App — настройки приложения (имя, окружение)
-	App AppConfig `yaml:"app"`
-
-	// Exchange — настройки биржи Gate.io
-	Exchange ExchangeConfig `yaml:"exchange"`
-
-	// Symbols — список торгуемых пар, например ["BTC_USDT", "ETH_USDT"]
-	Symbols []string `yaml:"symbols"`
-
-	// Orderbook — настройки стакана
-	Orderbook OrderbookConfig `yaml:"orderbook"`
-
-	// Redis — настройки подключения к Redis
-	Redis RedisConfig `yaml:"redis"`
-
-	// Storage — размеры окон хранения данных
-	Storage StorageConfig `yaml:"storage"`
+// SecretsConfig — секреты из .env файла.
+// Никогда не хранятся в config.yaml — только в .env!
+type SecretsConfig struct {
+	// APIKey — Gate.io API ключ (GATE_API_KEY в .env)
+	APIKey string
+	// APISecret — Gate.io API Secret (GATE_API_SECRET в .env)
+	APISecret string
 }
 
-// =============================================================================
-// ФУНКЦИЯ ЗАГРУЗКИ КОНФИГУРАЦИИ
-// =============================================================================
+// Config — главная структура конфигурации.
+// Единственный источник всех настроек бота.
+// Создаётся один раз в main() и передаётся во все модули.
+type Config struct {
+	App       AppConfig      `yaml:"app"`
+	Exchange  ExchangeConfig `yaml:"exchange"`
+	Symbols   []string       `yaml:"symbols"`
+	Orderbook OrderbookConfig `yaml:"orderbook"`
+	Redis     RedisConfig    `yaml:"redis"`
+	Storage   StorageConfig  `yaml:"storage"`
+	// Secrets не имеет тега yaml — заполняется из переменных окружения.
+	Secrets SecretsConfig
+}
 
-// Load загружает конфигурацию из файлов config.yaml и .env.
+// Load загружает конфигурацию из config.yaml и .env.
 //
-// Возвращает указатель *Config а не значение Config по двум причинам:
-// 1. Эффективность — не копируем всю структуру при передаче между модулями,
-//    передаём только адрес в памяти (8 байт вместо сотен байт).
-// 2. Возможность проверить nil — если конфиг не загружен, указатель = nil.
-//
-// Паттерн возврата (результат, ошибка) — стандарт Go.
-// Вызывающий код ОБЯЗАН проверить ошибку перед использованием конфига.
+// Порядок загрузки:
+//  1. Загружаем .env → переменные окружения
+//  2. Читаем config.yaml → основные настройки
+//  3. Читаем переменные окружения → секреты
+//  4. Валидируем все критичные поля
 func Load(configPath string) (*Config, error) {
-	// -------------------------------------------------------------------------
-	// ШАГ 1: Загружаем .env файл
-	// godotenv читает .env и записывает пары KEY=VALUE
-	// в переменные окружения процесса через os.Setenv.
-	// После этого можно читать их через os.Getenv("KEY").
-	//
-	// Важно: если .env не найден — не считаем это ошибкой.
-	// На боевом VDS секреты могут быть заданы системными переменными окружения
-	// а не через файл .env.
-	// -------------------------------------------------------------------------
-	_ = godotenv.Load() // игнорируем ошибку если .env не найден
+	// ШАГ 1: Загружаем .env.
+	// Ошибку игнорируем — на VDS секреты задаются системно.
+	_ = godotenv.Load()
 
-	// -------------------------------------------------------------------------
-	// ШАГ 2: Открываем файл config.yaml
-	// os.Open возвращает два значения: файл и ошибку.
-	// Если файл не найден — возвращаем ошибку с подробным описанием.
-	// fmt.Errorf создаёт новую ошибку с форматированным текстом.
-	// %w — специальный глагол для "оборачивания" ошибки,
-	// позволяет извлечь оригинальную ошибку через errors.Unwrap().
-	// -------------------------------------------------------------------------
+	// ШАГ 2: Открываем config.yaml.
 	file, err := os.Open(configPath)
 	if err != nil {
-		// Возвращаем nil вместо конфига и описание ошибки.
-		// nil для указателя означает "пустое значение" — конфиг не создан.
 		return nil, fmt.Errorf("не удалось открыть config.yaml: %w", err)
 	}
-	// defer — откладывает выполнение до момента выхода из функции Load.
-	// Гарантирует что файл будет закрыт даже если произошла ошибка ниже.
-	// Это Go идиома для управления ресурсами вместо try/finally.
 	defer file.Close()
 
-	// -------------------------------------------------------------------------
-	// ШАГ 3: Парсим YAML в структуру Config
-	// Создаём пустую структуру Config.
-	// cfg — это переменная типа Config, все поля заполнены нулевыми значениями
-	// (пустые строки, нули, nil срезы).
-	// -------------------------------------------------------------------------
+	// ШАГ 3: Парсим YAML → Config.
+	// &cfg — передаём адрес, декодер пишет напрямую в память.
 	var cfg Config
-
-	// yaml.NewDecoder создаёт декодер который читает из файла.
-	// Decode заполняет поля структуры cfg значениями из YAML.
-	// Теги yaml:"name" указывают декодеру какое поле YAML
-	// соответствует какому полю структуры.
 	if err := yaml.NewDecoder(file).Decode(&cfg); err != nil {
-		// &cfg — передаём АДРЕС переменной cfg (указатель).
-		// Без & декодер получил бы копию и не смог бы изменить оригинал.
-		// Это прямой доступ к памяти через указатель — декодер пишет
-		// прямо в нашу переменную cfg минуя создание копии.
 		return nil, fmt.Errorf("не удалось разобрать config.yaml: %w", err)
 	}
 
-	// -------------------------------------------------------------------------
-	// ШАГ 4: Загружаем секреты из переменных окружения
-	// os.Getenv читает переменную окружения которую godotenv
-	// загрузил из .env файла на шаге 1.
-	// Секреты никогда не хранятся в config.yaml — только в .env!
-	// -------------------------------------------------------------------------
-
-	// Пароль Redis из переменной окружения REDIS_PASSWORD.
-	// Если переменная не задана — os.Getenv вернёт пустую строку "".
-	// Пустой пароль означает что Redis работает без аутентификации.
+	// ШАГ 4: Загружаем секреты из переменных окружения.
+	cfg.Secrets.APIKey = os.Getenv("GATE_API_KEY")
+	cfg.Secrets.APISecret = os.Getenv("GATE_API_SECRET")
 	cfg.Redis.Password = os.Getenv("REDIS_PASSWORD")
 
-	// -------------------------------------------------------------------------
-	// ШАГ 5: Возвращаем указатель на заполненную структуру
-	// &cfg — берём адрес локальной переменной cfg.
-	// В Go это безопасно! В отличие от C, Go не уничтожает переменную
-	// после выхода из функции если на неё есть указатель —
-	// сборщик мусора (GC) сохранит её в памяти пока есть ссылки.
-	// -------------------------------------------------------------------------
+	// ШАГ 5: Валидация — падаем здесь с понятной ошибкой
+	// вместо загадочного сбоя глубже в коде.
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validate проверяет все критичные поля конфигурации.
+// Приватный метод — вызывается только из Load.
+// Вынесен отдельно чтобы не загромождать Load.
+func (c *Config) validate() error {
+	// Секреты
+	if c.Secrets.APIKey == "" {
+		return fmt.Errorf("GATE_API_KEY не задан в .env файле")
+	}
+	if c.Secrets.APISecret == "" {
+		return fmt.Errorf("GATE_API_SECRET не задан в .env файле")
+	}
+
+	// Биржа
+	if c.Exchange.RestURL == "" {
+		return fmt.Errorf("exchange.rest_url не задан в config.yaml")
+	}
+	if c.Exchange.WsURL == "" {
+		return fmt.Errorf("exchange.ws_url не задан в config.yaml")
+	}
+
+	// Символы
+	if len(c.Symbols) == 0 {
+		return fmt.Errorf("symbols не заданы в config.yaml")
+	}
+
+	return nil
 }
