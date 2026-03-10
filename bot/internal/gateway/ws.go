@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -57,7 +58,10 @@ func (c *WSClient) writeMessage(messageType int, data []byte) error {
 }
 
 func (c *WSClient) Connect(ctx context.Context) error {
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.url, nil)
+	header := http.Header{
+		"X-Gate-Size-Decimal": []string{"1"},
+	}
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.url, header)
 	if err != nil {
 		return fmt.Errorf("WS коннект не удался: %w", err)
 	}
@@ -80,9 +84,10 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 	}
 	log.Printf("🏓 Первый ping отправлен [%d]", utils.NowUnix())
 
-	ticker := time.NewTicker(10 * time.Second)
+	// Увеличили с 10 до 20 секунд — проверяем гипотезу о throttle биржи
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
-	log.Println("🏓 Ping loop запущен")
+	log.Println("🏓 Ping loop запущен (интервал 20s)")
 
 	for {
 		select {
@@ -102,26 +107,9 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	log.Println("👂 Read loop запущен")
 
-	// Счётчики сообщений по каждому каналу.
-	// Используем для двух целей:
-	// 1. Прореживание лога — не спамим терминал
-	// 2. Статистика — видим что данные реально идут
-	var obCount, tradeCount, candleCount, totalCount int
-
-	// Каждые 5 секунд печатаем сколько сообщений получили.
-	// Так мы ВСЕГДА видим что бот живой даже если данные не логируются.
-	statTicker := time.NewTicker(5 * time.Second)
-	defer statTicker.Stop()
+	var tickerCount int
 
 	for {
-		// Неблокирующая проверка тикера статистики.
-		select {
-		case <-statTicker.C:
-			log.Printf("📊 Статистика: всего=%d | стакан=%d | тики=%d | свечи=%d",
-				totalCount, obCount, tradeCount, candleCount)
-		default:
-		}
-
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -135,8 +123,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			log.Printf("❌ WS ошибка: %v", err)
 			return
 		}
-
-		totalCount++
 
 		var msg WSResponse
 		if err := json.Unmarshal(raw, &msg); err != nil {
@@ -161,37 +147,13 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 		}
 
 		switch msg.Channel {
-
-		case "futures.order_book":
-			obCount++
-			// Каждое 100-е сообщение стакана
-			if obCount%100 == 0 {
-				preview := string(raw)
-				if len(preview) > 100 {
-					preview = preview[:100] + "..."
-				}
-				log.Printf("📖 [%d] %s", obCount, preview)
-			}
-
-		case "futures.trades":
-			tradeCount++
-			// Каждый 20-й тик
-			if tradeCount%20 == 0 {
-				preview := string(raw)
-				if len(preview) > 100 {
-					preview = preview[:100] + "..."
-				}
-				log.Printf("💹 [%d] %s", tradeCount, preview)
-			}
-
-		case "futures.candlesticks":
-			candleCount++
-			// Все свечи — их мало
+		case "futures.tickers":
+			tickerCount++
 			preview := string(raw)
-			if len(preview) > 100 {
-				preview = preview[:100] + "..."
+			if len(preview) > 120 {
+				preview = preview[:120] + "..."
 			}
-			log.Printf("🕯️ [%d] %s", candleCount, preview)
+			log.Printf("📈 [%d] %s", tickerCount, preview)
 		}
 	}
 }
