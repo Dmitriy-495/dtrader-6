@@ -48,11 +48,17 @@ func main() {
 	go wsClient.ReadLoop(ctx)
 	go wsClient.RunPingLoop(ctx)
 
-	if err := wsClient.SubscribeTickers([]string{"BTC_USDT"}); err != nil {
+	// Подписка на tickers
+	if err := wsClient.SubscribeTickers(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на tickers: %v", err)
 	}
 
-	fmt.Println("✅ Бот запущен! tickers BTC_USDT + ping/pong... (Ctrl+C для остановки)")
+	// Подписка на trades
+	if err := wsClient.SubscribeTrades(cfg.Symbols); err != nil {
+		log.Fatalf("❌ Ошибка подписки на trades: %v", err)
+	}
+
+	fmt.Println("✅ Бот запущен! tickers + trades... (Ctrl+C для остановки)")
 	<-ctx.Done()
 	fmt.Println("\n👋 Завершение работы...")
 }

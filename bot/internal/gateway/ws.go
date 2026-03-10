@@ -84,7 +84,6 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 	}
 	log.Printf("🏓 Первый ping отправлен [%d]", utils.NowUnix())
 
-	// Увеличили с 10 до 20 секунд — проверяем гипотезу о throttle биржи
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	log.Println("🏓 Ping loop запущен (интервал 20s)")
@@ -107,7 +106,7 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	log.Println("👂 Read loop запущен")
 
-	var tickerCount int
+	var tickerCount, tradeCount int
 
 	for {
 		_, raw, err := c.conn.ReadMessage()
@@ -147,13 +146,28 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 		}
 
 		switch msg.Channel {
+
 		case "futures.tickers":
 			tickerCount++
-			preview := string(raw)
-			if len(preview) > 120 {
-				preview = preview[:120] + "..."
+			// Каждый 5-й тикер
+			if tickerCount%5 == 0 {
+				preview := string(raw)
+				if len(preview) > 120 {
+					preview = preview[:120] + "..."
+				}
+				log.Printf("📈 [%d] %s", tickerCount, preview)
 			}
-			log.Printf("📈 [%d] %s", tickerCount, preview)
+
+		case "futures.trades":
+			tradeCount++
+			// Каждый 20-й трейд
+			if tradeCount%20 == 0 {
+				preview := string(raw)
+				if len(preview) > 120 {
+					preview = preview[:120] + "..."
+				}
+				log.Printf("💹 [%d] %s", tradeCount, preview)
+			}
 		}
 	}
 }
