@@ -106,7 +106,7 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	log.Println("👂 Read loop запущен")
 
-	var tickerCount, tradeCount int
+	var tickerCount, tradeCount, obCount int
 
 	for {
 		_, raw, err := c.conn.ReadMessage()
@@ -149,7 +149,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 
 		case "futures.tickers":
 			tickerCount++
-			// Каждый 5-й тикер
 			if tickerCount%5 == 0 {
 				preview := string(raw)
 				if len(preview) > 120 {
@@ -160,13 +159,23 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 
 		case "futures.trades":
 			tradeCount++
-			// Каждый 20-й трейд
 			if tradeCount%20 == 0 {
 				preview := string(raw)
 				if len(preview) > 120 {
 					preview = preview[:120] + "..."
 				}
 				log.Printf("💹 [%d] %s", tradeCount, preview)
+			}
+
+		case "futures.order_book":
+			obCount++
+			// Стакан шлёт очень много сообщений — показываем каждое 100-е
+			if obCount%100 == 0 {
+				preview := string(raw)
+				if len(preview) > 120 {
+					preview = preview[:120] + "..."
+				}
+				log.Printf("📖 [%d] %s", obCount, preview)
 			}
 		}
 	}

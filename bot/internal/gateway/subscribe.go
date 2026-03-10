@@ -34,3 +34,22 @@ func (c *WSClient) SubscribeTrades(symbols []string) error {
 	log.Printf("💹 [trades] подписка отправлена: %v", symbols)
 	return nil
 }
+
+func (c *WSClient) SubscribeOrderBook(symbols []string) error {
+	for _, symbol := range symbols {
+		msg := WSRequest{
+			Time:    utils.NowUnix(),
+			Channel: "futures.order_book",
+			Event:   "subscribe",
+			// Три элемента: символ, глубина, интервал
+			// "20"  — глубина стакана (20 уровней bid + 20 ask)
+			// "0"   — интервал: 0 = каждое изменение без задержки
+			Payload: []string{symbol, "20", "0"},
+		}
+		if err := c.writeJSON(msg); err != nil {
+			return fmt.Errorf("subscribe order_book %s: %w", symbol, err)
+		}
+		log.Printf("📖 [order_book] подписка отправлена: %s depth=20", symbol)
+	}
+	return nil
+}
