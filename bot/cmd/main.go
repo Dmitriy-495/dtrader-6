@@ -92,7 +92,11 @@ func main() {
 		log.Fatalf("❌ Ошибка подписки на trades: %v", err)
 	}
 
-	fmt.Println("✅ Бот запущен! (Ctrl+C для остановки)")
+	if err := wsClient.SubscribeOrderBook(cfg.Symbols); err != nil {
+		log.Fatalf("❌ Ошибка подписки на order_book: %v", err)
+	}
+
+	fmt.Println("✅ Бот запущен! tickers + trades + order_book (Ctrl+C для остановки)")
 	<-ctx.Done()
 	fmt.Println("\n👋 Завершение работы...")
 }
