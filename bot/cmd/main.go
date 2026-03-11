@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/config"
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/gateway"
+	"github.com/Dmitriy-495/dtrader-6/bot/internal/publisher"
 )
 
 func main() {
@@ -25,15 +26,25 @@ func main() {
 	fmt.Printf("   Символы: %v\n", cfg.Symbols)
 	fmt.Printf("   Redis:   %s:%d\n", cfg.Redis.Host, cfg.Redis.Port)
 
+	// Инициализируем Redis publisher
+	pub := publisher.New(cfg.Redis.Host, cfg.Redis.Port, cfg.Redis.Password)
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), gateway.RequestTimeout)
+	if err := pub.Ping(pingCtx); err != nil {
+		log.Fatalf("❌ Redis недоступен: %v", err)
+	}
+	cancelPing()
+	fmt.Printf("✅ Redis подключён: %s:%d\n", cfg.Redis.Host, cfg.Redis.Port)
+	defer pub.Close()
+
 	newCtx := func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), gateway.RequestTimeout)
 	}
 
 	client := gateway.NewClient(cfg.Secrets.APIKey, cfg.Secrets.APISecret, cfg.Exchange.RestURL)
 
-	pingCtx, cancelPing := newCtx()
-	contractName, err := client.Ping(pingCtx)
-	cancelPing()
+	restPingCtx, cancelRestPing := newCtx()
+	contractName, err := client.Ping(restPingCtx)
+	cancelRestPing()
 	if err != nil {
 		log.Fatalf("❌ Ping не удался: %v", err)
 	}
@@ -74,7 +85,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	wsClient := gateway.NewWSClient(cfg.Exchange.WsURL, cfg.Secrets.APIKey, cfg.Secrets.APISecret)
+	wsClient := gateway.NewWSClient(cfg.Exchange.WsURL, cfg.Secrets.APIKey, cfg.Secrets.APISecret, pub)
 
 	if err := wsClient.Connect(ctx); err != nil {
 		log.Fatalf("❌ WS коннект не удался: %v", err)
@@ -87,24 +98,20 @@ func main() {
 	if err := wsClient.SubscribeTrades(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на trades: %v", err)
 	}
-
 	if err := wsClient.SubscribeOrderBookUpdate(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на order_book_update: %v", err)
 	}
-
 	if err := wsClient.SubscribeCandlesticks(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на candlesticks: %v", err)
 	}
-
 	if err := wsClient.SubscribePublicLiquidates(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на public_liquidates: %v", err)
 	}
-
 	if err := wsClient.SubscribeContractStats(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на contract_stats: %v", err)
 	}
 
-	fmt.Println("✅ Бот запущен! trades + order_book_update + candlesticks + liquidates + contract_stats (Ctrl+C для остановки)")
+	fmt.Println("✅ Бот запущен! Данные пишутся в Redis. (Ctrl+C для остановки)")
 	<-ctx.Done()
 	fmt.Println("\n👋 Завершение работы...")
 }
