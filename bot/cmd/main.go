@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/config"
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/gateway"
@@ -20,13 +21,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("❌ Ошибка загрузки конфига: %v", err)
 	}
-
 	fmt.Printf("✅ Конфиг загружен: %s (%s)\n", cfg.App.Name, cfg.App.Env)
 	fmt.Printf("   Биржа:   %s\n", cfg.Exchange.Name)
 	fmt.Printf("   Символы: %v\n", cfg.Symbols)
 	fmt.Printf("   Redis:   %s:%d\n", cfg.Redis.Host, cfg.Redis.Port)
 
-	// Инициализируем Redis publisher
 	pub := publisher.New(cfg.Redis.Host, cfg.Redis.Port, cfg.Redis.Password)
 	pingCtx, cancelPing := context.WithTimeout(context.Background(), gateway.RequestTimeout)
 	if err := pub.Ping(pingCtx); err != nil {
@@ -82,36 +81,79 @@ func main() {
 		}
 	}
 
+	// Глобальный контекст — живёт до Ctrl+C / SIGTERM
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	wsClient := gateway.NewWSClient(cfg.Exchange.WsURL, cfg.Secrets.APIKey, cfg.Secrets.APISecret, pub)
 
-	if err := wsClient.Connect(ctx); err != nil {
-		log.Fatalf("❌ WS коннект не удался: %v", err)
-	}
-	defer wsClient.Close()
-
-	go wsClient.ReadLoop(ctx)
-	go wsClient.RunPingLoop(ctx)
-
-	if err := wsClient.SubscribeTrades(cfg.Symbols); err != nil {
-		log.Fatalf("❌ Ошибка подписки на trades: %v", err)
-	}
-	if err := wsClient.SubscribeOrderBookUpdate(cfg.Symbols); err != nil {
-		log.Fatalf("❌ Ошибка подписки на order_book_update: %v", err)
-	}
-	if err := wsClient.SubscribeCandlesticks(cfg.Symbols); err != nil {
-		log.Fatalf("❌ Ошибка подписки на candlesticks: %v", err)
-	}
-	if err := wsClient.SubscribePublicLiquidates(cfg.Symbols); err != nil {
-		log.Fatalf("❌ Ошибка подписки на public_liquidates: %v", err)
-	}
-	if err := wsClient.SubscribeContractStats(cfg.Symbols); err != nil {
-		log.Fatalf("❌ Ошибка подписки на contract_stats: %v", err)
+	subscribeAll := func() error {
+		if err := wsClient.SubscribeTrades(cfg.Symbols); err != nil {
+			return fmt.Errorf("trades: %w", err)
+		}
+		if err := wsClient.SubscribeOrderBookUpdate(cfg.Symbols); err != nil {
+			return fmt.Errorf("order_book_update: %w", err)
+		}
+		if err := wsClient.SubscribeCandlesticks(cfg.Symbols); err != nil {
+			return fmt.Errorf("candlesticks: %w", err)
+		}
+		if err := wsClient.SubscribePublicLiquidates(cfg.Symbols); err != nil {
+			return fmt.Errorf("public_liquidates: %w", err)
+		}
+		if err := wsClient.SubscribeContractStats(cfg.Symbols); err != nil {
+			return fmt.Errorf("contract_stats: %w", err)
+		}
+		return nil
 	}
 
-	fmt.Println("✅ Бот запущен! Данные пишутся в Redis. (Ctrl+C для остановки)")
-	<-ctx.Done()
+	// Цикл реконнекта — при разрыве WS ждём 5 сек и переподключаемся
+	for {
+		wsClient.ResetDone()
+
+		if err := wsClient.Connect(ctx); err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			log.Printf("❌ WS коннект не удался: %v — повтор через 5 сек", err)
+			select {
+			case <-ctx.Done():
+				goto shutdown
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+
+		go wsClient.ReadLoop(ctx)
+		go wsClient.RunPingLoop(ctx)
+
+		if err := subscribeAll(); err != nil {
+			log.Printf("❌ Ошибка подписки: %v — реконнект через 5 сек", err)
+			wsClient.Close()
+			select {
+			case <-ctx.Done():
+				goto shutdown
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+
+		log.Println("✅ Бот запущен! Данные пишутся в Redis.")
+
+		select {
+		case <-ctx.Done():
+			goto shutdown
+		case <-wsClient.Done():
+			log.Println("🔄 WS разорван. Реконнект через 5 сек...")
+			wsClient.Close()
+			select {
+			case <-ctx.Done():
+				goto shutdown
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+
+shutdown:
 	fmt.Println("\n👋 Завершение работы...")
+	wsClient.Close()
 }

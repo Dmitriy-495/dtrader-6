@@ -34,8 +34,6 @@ type WSError struct {
 	Message string `json:"message"`
 }
 
-// WSClient — WebSocket клиент биржи.
-// pub — издатель данных в Redis, nil в режиме разработки без Redis.
 type WSClient struct {
 	url     string
 	apiKey  string
@@ -43,10 +41,25 @@ type WSClient struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
 	pub     *publisher.Publisher
+	done    chan struct{}
 }
 
 func NewWSClient(url, apiKey, secret string, pub *publisher.Publisher) *WSClient {
-	return &WSClient{url: url, apiKey: apiKey, secret: secret, pub: pub}
+	return &WSClient{
+		url:    url,
+		apiKey: apiKey,
+		secret: secret,
+		pub:    pub,
+		done:   make(chan struct{}, 1),
+	}
+}
+
+func (c *WSClient) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *WSClient) ResetDone() {
+	c.done = make(chan struct{}, 1)
 }
 
 func (c *WSClient) writeJSON(v interface{}) error {
@@ -87,15 +100,16 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 		return
 	}
 	log.Printf("🏓 Первый ping отправлен [%d]", utils.NowUnix())
-
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	log.Println("🏓 Ping loop запущен (интервал 20s)")
-
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("🛑 Ping loop остановлен")
+			return
+		case <-c.done:
+			log.Println("🛑 Ping loop: соединение разорвано, выход")
 			return
 		case <-ticker.C:
 			if err := c.sendPing(); err != nil {
@@ -107,36 +121,30 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 	}
 }
 
-// --- Структуры для парсинга входящих сообщений ---
-
-// Trade — одна сделка из futures.trades
 type Trade struct {
-	ID         int64   `json:"id"`
-	Contract   string  `json:"contract"`
-	Size       string  `json:"size"`
-	Price      string  `json:"price"`
-	CreateTime int64   `json:"create_time"`
-	CreateTimeMs int64 `json:"create_time_ms"`
-	IsInternal bool    `json:"is_internal"`
+	ID           int64  `json:"id"`
+	Contract     string `json:"contract"`
+	Size         string `json:"size"`
+	Price        string `json:"price"`
+	CreateTime   int64  `json:"create_time"`
+	CreateTimeMs int64  `json:"create_time_ms"`
+	IsInternal   bool   `json:"is_internal"`
 }
 
-// OBLevel — уровень стакана {p: price, s: size}
 type OBLevel struct {
 	Price string `json:"p"`
 	Size  string `json:"s"`
 }
 
-// OrderBookUpdate — обновление стакана из futures.order_book_update
 type OrderBookUpdate struct {
-	T        int64     `json:"t"`
-	S        string    `json:"s"`
-	U        int64     `json:"u"`
-	FirstU   int64     `json:"U"`
-	Bids     []OBLevel `json:"b"`
-	Asks     []OBLevel `json:"a"`
+	T      int64     `json:"t"`
+	S      string    `json:"s"`
+	U      int64     `json:"u"`
+	FirstU int64     `json:"U"`
+	Bids   []OBLevel `json:"b"`
+	Asks   []OBLevel `json:"a"`
 }
 
-// Candle — свеча из futures.candlesticks
 type Candle struct {
 	T      int64  `json:"t"`
 	Open   string `json:"o"`
@@ -146,10 +154,9 @@ type Candle struct {
 	Volume string `json:"v"`
 	Name   string `json:"n"`
 	Amount string `json:"a"`
-	Window bool   `json:"w"` // true = свеча закрыта
+	Window bool   `json:"w"`
 }
 
-// Liquidation — ликвидация из futures.public_liquidates
 type Liquidation struct {
 	Price    float64 `json:"price"`
 	Size     string  `json:"size"`
@@ -157,34 +164,37 @@ type Liquidation struct {
 	Contract string  `json:"contract"`
 }
 
-// ContractStats — статистика контракта из futures.contract_stats
 type ContractStats struct {
-	Time            int64   `json:"time"`
-	Contract        string  `json:"contract"`
-	OpenInterest    string  `json:"open_interest"`
-	OpenInterestUSD float64 `json:"open_interest_usd"`
-	LsrTaker        float64 `json:"lsr_taker"`
-	LsrAccount      float64 `json:"lsr_account"`
-	LongLiqSize     string  `json:"long_liq_size"`
-	ShortLiqSize    string  `json:"short_liq_size"`
-	LongLiqUSD      float64 `json:"long_liq_usd"`
-	ShortLiqUSD     float64 `json:"short_liq_usd"`
-	TopLsrAccount   string  `json:"top_lsr_account"`
-	TopLsrSize      string  `json:"top_lsr_size"`
-	MarkPrice       float64 `json:"mark_price"`
+	Time            int64       `json:"time"`
+	Contract        string      `json:"contract"`
+	OpenInterest    json.Number `json:"open_interest"`
+	OpenInterestUSD json.Number `json:"open_interest_usd"`
+	LsrTaker        json.Number `json:"lsr_taker"`
+	LsrAccount      json.Number `json:"lsr_account"`
+	LongLiqSize     json.Number `json:"long_liq_size"`
+	ShortLiqSize    json.Number `json:"short_liq_size"`
+	LongLiqUSD      json.Number `json:"long_liq_usd"`
+	ShortLiqUSD     json.Number `json:"short_liq_usd"`
+	TopLsrAccount   json.Number `json:"top_lsr_account"`
+	TopLsrSize      json.Number `json:"top_lsr_size"`
+	MarkPrice       json.Number `json:"mark_price"`
 }
 
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	log.Println("👂 Read loop запущен")
-
+	signalDone := func() {
+		select {
+		case c.done <- struct{}{}:
+		default:
+		}
+	}
 	var (
-		tradeCount int
-		obCount    int
+		tradeCount  int
+		obCount     int
 		candleCount int
-		liqCount   int
-		statsCount int
+		liqCount    int
+		statsCount  int
 	)
-
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
@@ -194,36 +204,31 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			}
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Println("🔌 WS закрыт биржей штатно")
-				return
+			} else {
+				log.Printf("❌ WS ошибка: %v", err)
 			}
-			log.Printf("❌ WS ошибка: %v", err)
+			signalDone()
 			return
 		}
-
 		var msg WSResponse
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			log.Printf("⚠️ Не удалось разобрать: %s", string(raw))
 			continue
 		}
-
 		if msg.Channel == "futures.pong" {
 			log.Printf("🏓 Pong получен [%d]", msg.Time)
 			continue
 		}
-
 		if msg.Error != nil {
 			log.Printf("❌ Ошибка биржи: code=%d msg=%s channel=%s",
 				msg.Error.Code, msg.Error.Message, msg.Channel)
 			continue
 		}
-
 		if msg.Event == "subscribe" {
 			log.Printf("✅ Подписка подтверждена: channel=%s", msg.Channel)
 			continue
 		}
-
 		switch msg.Channel {
-
 		case "futures.trades":
 			var trades []Trade
 			if err := json.Unmarshal(msg.Result, &trades); err != nil {
@@ -231,7 +236,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				continue
 			}
 			for _, t := range trades {
-				// пропускаем внутренние трейды — не попадают в свечи
 				if t.IsInternal {
 					continue
 				}
@@ -248,7 +252,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			if tradeCount%20 == 0 {
 				log.Printf("💹 [%d] trades записано в Redis", tradeCount)
 			}
-
 		case "futures.order_book_update":
 			var ob OrderBookUpdate
 			if err := json.Unmarshal(msg.Result, &ob); err != nil {
@@ -262,7 +265,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			if obCount%100 == 0 {
 				log.Printf("📖 [%d] orderbook записан в Redis", obCount)
 			}
-
 		case "futures.candlesticks":
 			var candles []Candle
 			if err := json.Unmarshal(msg.Result, &candles); err != nil {
@@ -271,12 +273,10 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			}
 			for _, candle := range candles {
 				candleCount++
-				// записываем только закрытую свечу (w=true)
 				if candle.Window && c.pub != nil {
-					// извлекаем символ из имени "1m_BTC_USDT" → "BTC_USDT"
 					symbol := candle.Name
 					if len(symbol) > 3 {
-						symbol = symbol[3:] // убираем "1m_"
+						symbol = symbol[3:]
 					}
 					_ = c.pub.PublishCandle(ctx, symbol, candle)
 				}
@@ -284,7 +284,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			if candleCount%10 == 0 {
 				log.Printf("🕯️ [%d] свечей обработано", candleCount)
 			}
-
 		case "futures.public_liquidates":
 			var liqs []Liquidation
 			if err := json.Unmarshal(msg.Result, &liqs); err != nil {
@@ -303,7 +302,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				log.Printf("💥 [%d] ликвидация: %s price=%.1f size=%s",
 					liqCount, liq.Contract, liq.Price, liq.Size)
 			}
-
 		case "futures.contract_stats":
 			var stats ContractStats
 			if err := json.Unmarshal(msg.Result, &stats); err != nil {
@@ -314,7 +312,7 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			if c.pub != nil {
 				_ = c.pub.PublishContractStats(ctx, stats.Contract, stats)
 			}
-			log.Printf("📊 [%d] stats: %s OI=%s LSR=%.3f",
+			log.Printf("📊 [%d] stats: %s OI=%s LSR=%s",
 				statsCount, stats.Contract, stats.OpenInterest, stats.LsrTaker)
 		}
 	}
