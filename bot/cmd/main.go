@@ -84,10 +84,6 @@ func main() {
 	go wsClient.ReadLoop(ctx)
 	go wsClient.RunPingLoop(ctx)
 
-	if err := wsClient.SubscribeTickers(cfg.Symbols); err != nil {
-		log.Fatalf("❌ Ошибка подписки на tickers: %v", err)
-	}
-
 	if err := wsClient.SubscribeTrades(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на trades: %v", err)
 	}
@@ -96,7 +92,11 @@ func main() {
 		log.Fatalf("❌ Ошибка подписки на order_book: %v", err)
 	}
 
-	fmt.Println("✅ Бот запущен! tickers + trades + order_book (Ctrl+C для остановки)")
+	if err := wsClient.SubscribeCandlesticks(cfg.Symbols); err != nil {
+		log.Fatalf("❌ Ошибка подписки на candlesticks: %v", err)
+	}
+
+	fmt.Println("✅ Бот запущен! trades + order_book + candlesticks (Ctrl+C для остановки)")
 	<-ctx.Done()
 	fmt.Println("\n👋 Завершение работы...")
 }
