@@ -21,3 +21,4 @@ Thumbs.db
 # Node.js
 node_modules/
 dist/
+CHECKPOINT_*.md
