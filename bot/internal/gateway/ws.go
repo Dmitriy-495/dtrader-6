@@ -169,8 +169,8 @@ type ContractStats struct {
 	ShortLiqSize    string  `json:"short_liq_size"`
 	LongLiqUSD      float64 `json:"long_liq_usd"`
 	ShortLiqUSD     float64 `json:"short_liq_usd"`
-	TopLsrAccount   float64 `json:"top_lsr_account"`
-	TopLsrSize      float64 `json:"top_lsr_size"`
+	TopLsrAccount   string  `json:"top_lsr_account"`
+	TopLsrSize      string  `json:"top_lsr_size"`
 	MarkPrice       float64 `json:"mark_price"`
 }
 
