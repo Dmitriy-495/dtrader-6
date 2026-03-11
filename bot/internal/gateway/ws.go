@@ -106,7 +106,13 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	log.Println("👂 Read loop запущен")
 
-	var tradeCount, obCount, candleCount int
+	var (
+		tradeCount  int
+		obCount     int
+		candleCount int
+		liqCount    int
+		statsCount  int
+	)
 
 	for {
 		_, raw, err := c.conn.ReadMessage()
@@ -157,8 +163,9 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				log.Printf("💹 [%d] %s", tradeCount, preview)
 			}
 
-		case "futures.order_book":
+		case "futures.order_book_update":
 			obCount++
+			// стакан шлёт очень часто — каждые 100ms на 3 пары = ~30/сек
 			if obCount%100 == 0 {
 				preview := string(raw)
 				if len(preview) > 120 {
@@ -168,13 +175,27 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			}
 
 		case "futures.candlesticks":
-			// Свечи приходят редко — логируем все
+			// свечи логируем все — приходят редко
 			candleCount++
 			preview := string(raw)
 			if len(preview) > 120 {
 				preview = preview[:120] + "..."
 			}
 			log.Printf("🕯️ [%d] %s", candleCount, preview)
+
+		case "futures.public_liquidates":
+			// ликвидации логируем все — важные события
+			liqCount++
+			log.Printf("💥 [%d] %s", liqCount, string(raw))
+
+		case "futures.contract_stats":
+			// статистика раз в минуту — логируем все
+			statsCount++
+			preview := string(raw)
+			if len(preview) > 120 {
+				preview = preview[:120] + "..."
+			}
+			log.Printf("📊 [%d] %s", statsCount, preview)
 		}
 	}
 }

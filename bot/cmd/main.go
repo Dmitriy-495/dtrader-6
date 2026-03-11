@@ -88,15 +88,23 @@ func main() {
 		log.Fatalf("❌ Ошибка подписки на trades: %v", err)
 	}
 
-	if err := wsClient.SubscribeOrderBook(cfg.Symbols); err != nil {
-		log.Fatalf("❌ Ошибка подписки на order_book: %v", err)
+	if err := wsClient.SubscribeOrderBookUpdate(cfg.Symbols); err != nil {
+		log.Fatalf("❌ Ошибка подписки на order_book_update: %v", err)
 	}
 
 	if err := wsClient.SubscribeCandlesticks(cfg.Symbols); err != nil {
 		log.Fatalf("❌ Ошибка подписки на candlesticks: %v", err)
 	}
 
-	fmt.Println("✅ Бот запущен! trades + order_book + candlesticks (Ctrl+C для остановки)")
+	if err := wsClient.SubscribePublicLiquidates(cfg.Symbols); err != nil {
+		log.Fatalf("❌ Ошибка подписки на public_liquidates: %v", err)
+	}
+
+	if err := wsClient.SubscribeContractStats(cfg.Symbols); err != nil {
+		log.Fatalf("❌ Ошибка подписки на contract_stats: %v", err)
+	}
+
+	fmt.Println("✅ Бот запущен! trades + order_book_update + candlesticks + liquidates + contract_stats (Ctrl+C для остановки)")
 	<-ctx.Done()
 	fmt.Println("\n👋 Завершение работы...")
 }
