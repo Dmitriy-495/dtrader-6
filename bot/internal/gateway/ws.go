@@ -175,6 +175,21 @@ type ContractStats struct {
 	MarkPrice       json.Number `json:"mark_price"`
 }
 
+// parseLiquidations парсит ликвидации — биржа шлёт то массив то объект
+func parseLiquidations(raw json.RawMessage) ([]Liquidation, error) {
+	// пробуем массив
+	var liqs []Liquidation
+	if err := json.Unmarshal(raw, &liqs); err == nil {
+		return liqs, nil
+	}
+	// пробуем одиночный объект
+	var liq Liquidation
+	if err := json.Unmarshal(raw, &liq); err == nil {
+		return []Liquidation{liq}, nil
+	}
+	return nil, fmt.Errorf("не удалось распарсить ликвидацию")
+}
+
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	signalDone := func() {
 		select {
@@ -200,7 +215,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			continue
 		}
 		if msg.Channel == "futures.pong" {
-			// Записываем timestamp pong в Redis — TUI покажет EXCH индикатор
 			if c.pub != nil {
 				_ = c.pub.PublishExchangePing(ctx)
 			}
@@ -260,8 +274,8 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				}
 			}
 		case "futures.public_liquidates":
-			var liqs []Liquidation
-			if err := json.Unmarshal(msg.Result, &liqs); err != nil {
+			liqs, err := parseLiquidations(msg.Result)
+			if err != nil {
 				log.Printf("⚠️ liquidates parse error: %v", err)
 				continue
 			}
