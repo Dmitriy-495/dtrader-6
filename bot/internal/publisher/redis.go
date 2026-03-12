@@ -5,14 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	maxTrades      = 1000 // максимум тиков в стриме
-	maxLiquidations = 500  // максимум ликвидаций в стриме
-	maxCandles     = 200  // максимум свечей в листе
+	maxTrades       = 1000
+	maxLiquidations = 500
+	maxCandles      = 200
 )
 
 type Publisher struct {
@@ -36,8 +37,6 @@ func (p *Publisher) Close() error {
 	return p.rdb.Close()
 }
 
-// PublishTrade — пишет тик в Stream market:trades:{symbol}
-// size > 0 = taker покупатель, size < 0 = taker продавец
 func (p *Publisher) PublishTrade(ctx context.Context, symbol string, data map[string]interface{}) error {
 	key := fmt.Sprintf("market:trades:%s", symbol)
 	err := p.rdb.XAdd(ctx, &redis.XAddArgs{
@@ -52,8 +51,6 @@ func (p *Publisher) PublishTrade(ctx context.Context, symbol string, data map[st
 	return nil
 }
 
-// PublishOrderBook — перезаписывает снапшот стакана
-// храним последнее состояние — indicator-engine строит imbalance из него
 func (p *Publisher) PublishOrderBook(ctx context.Context, symbol string, data interface{}) error {
 	key := fmt.Sprintf("market:orderbook:%s", symbol)
 	raw, err := json.Marshal(data)
@@ -66,8 +63,6 @@ func (p *Publisher) PublishOrderBook(ctx context.Context, symbol string, data in
 	return nil
 }
 
-// PublishCandle — пишет ТОЛЬКО закрытую свечу (w=true) в List
-// LTRIM держит последние 200 свечей
 func (p *Publisher) PublishCandle(ctx context.Context, symbol string, data interface{}) error {
 	key := fmt.Sprintf("market:candles:1m:%s", symbol)
 	raw, err := json.Marshal(data)
@@ -76,7 +71,7 @@ func (p *Publisher) PublishCandle(ctx context.Context, symbol string, data inter
 	}
 	pipe := p.rdb.Pipeline()
 	pipe.RPush(ctx, key, raw)
-	pipe.LTrim(ctx, key, -maxCandles, -1) // храним последние 200
+	pipe.LTrim(ctx, key, -maxCandles, -1)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("PublishCandle %s: %w", symbol, err)
 	}
@@ -84,7 +79,6 @@ func (p *Publisher) PublishCandle(ctx context.Context, symbol string, data inter
 	return nil
 }
 
-// PublishLiquidation — пишет ликвидацию в Stream market:liquidations:{symbol}
 func (p *Publisher) PublishLiquidation(ctx context.Context, symbol string, data map[string]interface{}) error {
 	key := fmt.Sprintf("market:liquidations:%s", symbol)
 	err := p.rdb.XAdd(ctx, &redis.XAddArgs{
@@ -96,12 +90,9 @@ func (p *Publisher) PublishLiquidation(ctx context.Context, symbol string, data 
 	if err != nil {
 		return fmt.Errorf("PublishLiquidation %s: %w", symbol, err)
 	}
-	log.Printf("💥 [redis] ликвидация записана: %s", symbol)
 	return nil
 }
 
-// PublishContractStats — перезаписывает последнюю статистику контракта
-// OI, LSR, ликвидации агрегировано — обновляется раз в минуту
 func (p *Publisher) PublishContractStats(ctx context.Context, symbol string, data interface{}) error {
 	key := fmt.Sprintf("market:stats:%s", symbol)
 	raw, err := json.Marshal(data)
@@ -112,4 +103,10 @@ func (p *Publisher) PublishContractStats(ctx context.Context, symbol string, dat
 		return fmt.Errorf("PublishContractStats %s: %w", symbol, err)
 	}
 	return nil
+}
+
+// PublishExchangePing — записывает timestamp последнего pong от биржи.
+// ws-server читает это значение и транслирует клиентам как EXCH индикатор.
+func (p *Publisher) PublishExchangePing(ctx context.Context) error {
+	return p.rdb.Set(ctx, "system:exchange_ping", time.Now().UnixMilli(), 60*time.Second).Err()
 }

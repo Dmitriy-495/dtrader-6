@@ -48,6 +48,7 @@ func main() {
 
 	r := reader.New(rdb, h, cfg.Symbols)
 	r.RunAll(ctx)
+	r.RunSystem(ctx)
 
 	wsHandler := handler.New(h, cfg.Secrets.APIKey)
 	http.Handle("/ws", wsHandler)

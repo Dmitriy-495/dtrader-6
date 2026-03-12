@@ -200,6 +200,10 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			continue
 		}
 		if msg.Channel == "futures.pong" {
+			// Записываем timestamp pong в Redis — TUI покажет EXCH индикатор
+			if c.pub != nil {
+				_ = c.pub.PublishExchangePing(ctx)
+			}
 			continue
 		}
 		if msg.Error != nil {

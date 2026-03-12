@@ -201,7 +201,7 @@ func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 // Нет смысла слать одинаковые данные каждые 5 секунд.
 func (r *Reader) pollStats(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:stats:%s", symbol)
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	var lastVal string
 	for {
@@ -267,4 +267,43 @@ func (r *Reader) pollCandles(ctx context.Context, symbol string) {
 			})
 		}
 	}
+}
+
+// SystemMsg — служебное сообщение heartbeat от ws-server к TUI
+type SystemMsg struct {
+	ServerTs   int64 `json:"server_ts"`   // timestamp ws-server (для SERV latency)
+	ExchangeTs int64 `json:"exchange_ts"` // timestamp последнего pong от биржи
+}
+
+// RunSystem запускает горутину heartbeat — шлёт system сообщение каждые 5s.
+// TUI использует server_ts для расчёта SERV latency,
+// exchange_ts для отображения свежести EXCH индикатора.
+func (r *Reader) RunSystem(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		log.Println("📡 Reader system: heartbeat запущен (интервал 20s)")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Читаем последний pong от биржи
+				var exchTs int64
+				val, err := r.rdb.Get(ctx, "system:exchange_ping").Result()
+				if err == nil {
+					exchTs, _ = strconv.ParseInt(val, 10, 64)
+				}
+
+				r.hub.Broadcast(hub.Message{
+					Channel: "system",
+					Symbol:  "",
+					Data: SystemMsg{
+						ServerTs:   time.Now().UnixMilli(),
+						ExchangeTs: exchTs,
+					},
+				})
+			}
+		}
+	}()
 }
