@@ -187,6 +187,7 @@ func parseLiquidations(raw json.RawMessage) ([]Liquidation, error) {
 	if err := json.Unmarshal(raw, &liq); err == nil {
 		return []Liquidation{liq}, nil
 	}
+	log.Printf("⚠️ liquidates raw: %s", string(raw))
 	return nil, fmt.Errorf("не удалось распарсить ликвидацию")
 }
 
