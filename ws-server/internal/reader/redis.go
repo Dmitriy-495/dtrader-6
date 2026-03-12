@@ -34,30 +34,23 @@ func (r *Reader) RunAll(ctx context.Context) {
 	log.Printf("📡 Reader: запущены горутины для %d символов", len(r.symbols))
 }
 
-// TradeAgg — агрегированные трейды за интервал 500ms.
-// Вместо потока тиков клиент получает сводку:
-// количество сделок, суммарный объём, направление давления.
 type TradeAgg struct {
 	Symbol    string  `json:"symbol"`
-	BuyVol    float64 `json:"buy_vol"`    // суммарный объём покупок
-	SellVol   float64 `json:"sell_vol"`   // суммарный объём продаж
-	BuyCount  int     `json:"buy_count"`  // количество покупок
-	SellCount int     `json:"sell_count"` // количество продаж
-	LastPrice string  `json:"last_price"` // последняя цена
-	Ts        int64   `json:"ts"`         // timestamp агрегата
+	BuyVol    float64 `json:"buy_vol"`
+	SellVol   float64 `json:"sell_vol"`
+	BuyCount  int     `json:"buy_count"`
+	SellCount int     `json:"sell_count"`
+	LastPrice string  `json:"last_price"`
+	Ts        int64   `json:"ts"`
 }
 
-// readTrades читает трейды из Stream и агрегирует за 500ms.
-// Клиент получает не каждый тик а сводку каждые полсекунды.
 func (r *Reader) readTrades(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:trades:%s", symbol)
 	lastID := "$"
 
-	// mu защищает агрегат от одновременного чтения/записи
 	var mu sync.Mutex
 	agg := &TradeAgg{Symbol: symbol}
 
-	// Горутина-отправщик: каждые 500ms отправляет агрегат если есть данные
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -72,7 +65,6 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 					continue
 				}
 				snapshot := *agg
-				// сбрасываем агрегат
 				agg = &TradeAgg{Symbol: symbol}
 				mu.Unlock()
 
@@ -86,7 +78,6 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 		}
 	}()
 
-	// Основной цикл: читаем тики из Redis Stream и накапливаем в агрегат
 	for {
 		if ctx.Err() != nil {
 			return
@@ -118,7 +109,7 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 					agg.BuyVol += size
 					agg.BuyCount++
 				} else {
-					agg.SellVol += -size // храним как положительное
+					agg.SellVol += -size
 					agg.SellCount++
 				}
 				agg.LastPrice = price
@@ -128,8 +119,6 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 	}
 }
 
-// readLiquidations читает ликвидации — отправляем каждую без агрегации
-// (ликвидации редкие и важные — не стоит их задерживать)
 func (r *Reader) readLiquidations(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:liquidations:%s", symbol)
 	lastID := "$"
@@ -166,8 +155,6 @@ func (r *Reader) readLiquidations(ctx context.Context, symbol string) {
 	}
 }
 
-// pollOrderBook читает стакан раз в 1s — достаточно для TUI.
-// Стакан меняется каждые 100ms но глаз человека не видит разницу быстрее 1s.
 func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:orderbook:%s", symbol)
 	ticker := time.NewTicker(time.Second)
@@ -197,11 +184,9 @@ func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 	}
 }
 
-// pollStats читает статистику и отправляет только при изменении OI или LSR.
-// Нет смысла слать одинаковые данные каждые 5 секунд.
 func (r *Reader) pollStats(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:stats:%s", symbol)
-	ticker := time.NewTicker(20 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	var lastVal string
 	for {
@@ -216,7 +201,6 @@ func (r *Reader) pollStats(ctx context.Context, symbol string) {
 				}
 				continue
 			}
-			// отправляем только если данные изменились
 			if val == lastVal {
 				continue
 			}
@@ -234,8 +218,6 @@ func (r *Reader) pollStats(ctx context.Context, symbol string) {
 	}
 }
 
-// pollCandles читает список свечей и отправляет только когда появляется новая.
-// Сравниваем timestamp последней свечи.
 func (r *Reader) pollCandles(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:candles:1m:%s", symbol)
 	ticker := time.NewTicker(10 * time.Second)
@@ -246,12 +228,10 @@ func (r *Reader) pollCandles(ctx context.Context, symbol string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// берём только последнюю свечу (индекс 0 = самая новая)
 			vals, err := r.rdb.LRange(ctx, key, 0, 0).Result()
 			if err != nil || len(vals) == 0 {
 				continue
 			}
-			// отправляем только если свеча новая
 			if vals[0] == lastTs {
 				continue
 			}
@@ -269,41 +249,62 @@ func (r *Reader) pollCandles(ctx context.Context, symbol string) {
 	}
 }
 
-// SystemMsg — служебное сообщение heartbeat от ws-server к TUI
-type SystemMsg struct {
-	ServerTs   int64 `json:"server_ts"`   // timestamp ws-server (для SERV latency)
-	ExchangeTs int64 `json:"exchange_ts"` // timestamp последнего pong от биржи
+// Balance — структура баланса аккаунта
+type Balance struct {
+	Total    string `json:"total"`
+	Margin   string `json:"margin"`
+	Leverage string `json:"leverage"`
 }
 
-// RunSystem запускает горутину heartbeat — шлёт system сообщение каждые 5s.
-// TUI использует server_ts для расчёта SERV latency,
-// exchange_ts для отображения свежести EXCH индикатора.
+// SystemMsg — служебное сообщение heartbeat от ws-server к TUI
+type SystemMsg struct {
+	ServerTs   int64   `json:"server_ts"`   // timestamp ws-server (для SERV latency)
+	ExchangeTs int64   `json:"exchange_ts"` // timestamp последнего pong от биржи
+	Balance    Balance `json:"balance"`     // текущий баланс аккаунта
+}
+
+// RunSystem запускает горутину heartbeat — шлёт system сообщение каждые 20s.
 func (r *Reader) RunSystem(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
 		log.Println("📡 Reader system: heartbeat запущен (интервал 20s)")
+
+		// Отправляем сразу при старте не дожидаясь первого тика
+		r.broadcastSystem(ctx)
+
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Читаем последний pong от биржи
-				var exchTs int64
-				val, err := r.rdb.Get(ctx, "system:exchange_ping").Result()
-				if err == nil {
-					exchTs, _ = strconv.ParseInt(val, 10, 64)
-				}
-
-				r.hub.Broadcast(hub.Message{
-					Channel: "system",
-					Symbol:  "",
-					Data: SystemMsg{
-						ServerTs:   time.Now().UnixMilli(),
-						ExchangeTs: exchTs,
-					},
-				})
+				r.broadcastSystem(ctx)
 			}
 		}
 	}()
+}
+
+// broadcastSystem читает данные из Redis и шлёт system сообщение
+func (r *Reader) broadcastSystem(ctx context.Context) {
+	// Читаем exchange ping
+	var exchTs int64
+	if val, err := r.rdb.Get(ctx, "system:exchange_ping").Result(); err == nil {
+		exchTs, _ = strconv.ParseInt(val, 10, 64)
+	}
+
+	// Читаем баланс
+	var balance Balance
+	if val, err := r.rdb.Get(ctx, "account:balance").Result(); err == nil {
+		_ = json.Unmarshal([]byte(val), &balance)
+	}
+
+	r.hub.Broadcast(hub.Message{
+		Channel: "system",
+		Symbol:  "",
+		Data: SystemMsg{
+			ServerTs:   time.Now().UnixMilli(),
+			ExchangeTs: exchTs,
+			Balance:    balance,
+		},
+	})
 }
