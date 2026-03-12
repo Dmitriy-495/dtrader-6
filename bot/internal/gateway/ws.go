@@ -99,24 +99,19 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 		log.Printf("❌ Первый ping не удался: %v", err)
 		return
 	}
-	log.Printf("🏓 Первый ping отправлен [%d]", utils.NowUnix())
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
-	log.Println("🏓 Ping loop запущен (интервал 20s)")
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("🛑 Ping loop остановлен")
 			return
 		case <-c.done:
-			log.Println("🛑 Ping loop: соединение разорвано, выход")
 			return
 		case <-ticker.C:
 			if err := c.sendPing(); err != nil {
 				log.Printf("❌ Ошибка ping: %v", err)
 				return
 			}
-			log.Printf("🏓 Ping отправлен [%d]", utils.NowUnix())
 		}
 	}
 }
@@ -181,30 +176,19 @@ type ContractStats struct {
 }
 
 func (c *WSClient) ReadLoop(ctx context.Context) {
-	log.Println("👂 Read loop запущен")
 	signalDone := func() {
 		select {
 		case c.done <- struct{}{}:
 		default:
 		}
 	}
-	var (
-		tradeCount  int
-		obCount     int
-		candleCount int
-		liqCount    int
-		statsCount  int
-	)
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
-				log.Println("🛑 Read loop остановлен")
 				return
 			}
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Println("🔌 WS закрыт биржей штатно")
-			} else {
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Printf("❌ WS ошибка: %v", err)
 			}
 			signalDone()
@@ -216,7 +200,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			continue
 		}
 		if msg.Channel == "futures.pong" {
-			log.Printf("🏓 Pong получен [%d]", msg.Time)
 			continue
 		}
 		if msg.Error != nil {
@@ -239,7 +222,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				if t.IsInternal {
 					continue
 				}
-				tradeCount++
 				if c.pub != nil {
 					_ = c.pub.PublishTrade(ctx, t.Contract, map[string]interface{}{
 						"id":    t.ID,
@@ -249,21 +231,14 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 					})
 				}
 			}
-			if tradeCount%20 == 0 {
-				log.Printf("💹 [%d] trades записано в Redis", tradeCount)
-			}
 		case "futures.order_book_update":
 			var ob OrderBookUpdate
 			if err := json.Unmarshal(msg.Result, &ob); err != nil {
 				log.Printf("⚠️ order_book_update parse error: %v", err)
 				continue
 			}
-			obCount++
 			if c.pub != nil {
 				_ = c.pub.PublishOrderBook(ctx, ob.S, ob)
-			}
-			if obCount%100 == 0 {
-				log.Printf("📖 [%d] orderbook записан в Redis", obCount)
 			}
 		case "futures.candlesticks":
 			var candles []Candle
@@ -272,7 +247,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				continue
 			}
 			for _, candle := range candles {
-				candleCount++
 				if candle.Window && c.pub != nil {
 					symbol := candle.Name
 					if len(symbol) > 3 {
@@ -281,9 +255,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 					_ = c.pub.PublishCandle(ctx, symbol, candle)
 				}
 			}
-			if candleCount%10 == 0 {
-				log.Printf("🕯️ [%d] свечей обработано", candleCount)
-			}
 		case "futures.public_liquidates":
 			var liqs []Liquidation
 			if err := json.Unmarshal(msg.Result, &liqs); err != nil {
@@ -291,7 +262,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				continue
 			}
 			for _, liq := range liqs {
-				liqCount++
 				if c.pub != nil {
 					_ = c.pub.PublishLiquidation(ctx, liq.Contract, map[string]interface{}{
 						"price":   liq.Price,
@@ -299,8 +269,6 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 						"time_ms": liq.TimeMs,
 					})
 				}
-				log.Printf("💥 [%d] ликвидация: %s price=%.1f size=%s",
-					liqCount, liq.Contract, liq.Price, liq.Size)
 			}
 		case "futures.contract_stats":
 			var stats ContractStats
@@ -308,12 +276,9 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 				log.Printf("⚠️ contract_stats parse error: %v", err)
 				continue
 			}
-			statsCount++
 			if c.pub != nil {
 				_ = c.pub.PublishContractStats(ctx, stats.Contract, stats)
 			}
-			log.Printf("📊 [%d] stats: %s OI=%s LSR=%s",
-				statsCount, stats.Contract, stats.OpenInterest, stats.LsrTaker)
 		}
 	}
 }
@@ -325,6 +290,5 @@ func (c *WSClient) Close() {
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
 		)
 		c.conn.Close()
-		log.Println("🔌 WS соединение закрыто")
 	}
 }

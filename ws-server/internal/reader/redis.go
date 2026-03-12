@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -32,10 +34,59 @@ func (r *Reader) RunAll(ctx context.Context) {
 	log.Printf("📡 Reader: запущены горутины для %d символов", len(r.symbols))
 }
 
+// TradeAgg — агрегированные трейды за интервал 500ms.
+// Вместо потока тиков клиент получает сводку:
+// количество сделок, суммарный объём, направление давления.
+type TradeAgg struct {
+	Symbol    string  `json:"symbol"`
+	BuyVol    float64 `json:"buy_vol"`    // суммарный объём покупок
+	SellVol   float64 `json:"sell_vol"`   // суммарный объём продаж
+	BuyCount  int     `json:"buy_count"`  // количество покупок
+	SellCount int     `json:"sell_count"` // количество продаж
+	LastPrice string  `json:"last_price"` // последняя цена
+	Ts        int64   `json:"ts"`         // timestamp агрегата
+}
+
+// readTrades читает трейды из Stream и агрегирует за 500ms.
+// Клиент получает не каждый тик а сводку каждые полсекунды.
 func (r *Reader) readTrades(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:trades:%s", symbol)
 	lastID := "$"
-	log.Printf("📡 Reader trades: слушаем %s", key)
+
+	// mu защищает агрегат от одновременного чтения/записи
+	var mu sync.Mutex
+	agg := &TradeAgg{Symbol: symbol}
+
+	// Горутина-отправщик: каждые 500ms отправляет агрегат если есть данные
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				if agg.BuyCount+agg.SellCount == 0 {
+					mu.Unlock()
+					continue
+				}
+				snapshot := *agg
+				// сбрасываем агрегат
+				agg = &TradeAgg{Symbol: symbol}
+				mu.Unlock()
+
+				snapshot.Ts = time.Now().UnixMilli()
+				r.hub.Broadcast(hub.Message{
+					Channel: "trades",
+					Symbol:  symbol,
+					Data:    snapshot,
+				})
+			}
+		}
+	}()
+
+	// Основной цикл: читаем тики из Redis Stream и накапливаем в агрегат
 	for {
 		if ctx.Err() != nil {
 			return
@@ -59,20 +110,29 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
 				lastID = msg.ID
-				r.hub.Broadcast(hub.Message{
-					Channel: "trades",
-					Symbol:  symbol,
-					Data:    msg.Values,
-				})
+				size, _ := strconv.ParseFloat(fmt.Sprintf("%v", msg.Values["size"]), 64)
+				price := fmt.Sprintf("%v", msg.Values["price"])
+
+				mu.Lock()
+				if size > 0 {
+					agg.BuyVol += size
+					agg.BuyCount++
+				} else {
+					agg.SellVol += -size // храним как положительное
+					agg.SellCount++
+				}
+				agg.LastPrice = price
+				mu.Unlock()
 			}
 		}
 	}
 }
 
+// readLiquidations читает ликвидации — отправляем каждую без агрегации
+// (ликвидации редкие и важные — не стоит их задерживать)
 func (r *Reader) readLiquidations(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:liquidations:%s", symbol)
 	lastID := "$"
-	log.Printf("📡 Reader liquidations: слушаем %s", key)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -106,11 +166,12 @@ func (r *Reader) readLiquidations(ctx context.Context, symbol string) {
 	}
 }
 
+// pollOrderBook читает стакан раз в 1s — достаточно для TUI.
+// Стакан меняется каждые 100ms но глаз человека не видит разницу быстрее 1s.
 func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:orderbook:%s", symbol)
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	log.Printf("📡 Reader orderbook: опрашиваем %s каждые 200ms", key)
 	for {
 		select {
 		case <-ctx.Done():
@@ -125,7 +186,6 @@ func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 			}
 			var data interface{}
 			if err := json.Unmarshal([]byte(val), &data); err != nil {
-				log.Printf("⚠️ Reader orderbook %s parse: %v", symbol, err)
 				continue
 			}
 			r.hub.Broadcast(hub.Message{
@@ -137,11 +197,13 @@ func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 	}
 }
 
+// pollStats читает статистику и отправляет только при изменении OI или LSR.
+// Нет смысла слать одинаковые данные каждые 5 секунд.
 func (r *Reader) pollStats(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:stats:%s", symbol)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	log.Printf("📡 Reader stats: опрашиваем %s каждые 5s", key)
+	var lastVal string
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,9 +216,13 @@ func (r *Reader) pollStats(ctx context.Context, symbol string) {
 				}
 				continue
 			}
+			// отправляем только если данные изменились
+			if val == lastVal {
+				continue
+			}
+			lastVal = val
 			var data interface{}
 			if err := json.Unmarshal([]byte(val), &data); err != nil {
-				log.Printf("⚠️ Reader stats %s parse: %v", symbol, err)
 				continue
 			}
 			r.hub.Broadcast(hub.Message{
@@ -168,38 +234,37 @@ func (r *Reader) pollStats(ctx context.Context, symbol string) {
 	}
 }
 
+// pollCandles читает список свечей и отправляет только когда появляется новая.
+// Сравниваем timestamp последней свечи.
 func (r *Reader) pollCandles(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:candles:1m:%s", symbol)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	log.Printf("📡 Reader candles: опрашиваем %s каждые 10s", key)
+	var lastTs string
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			vals, err := r.rdb.LRange(ctx, key, 0, 2).Result()
-			if err != nil {
-				log.Printf("⚠️ Reader candles %s: %v", symbol, err)
+			// берём только последнюю свечу (индекс 0 = самая новая)
+			vals, err := r.rdb.LRange(ctx, key, 0, 0).Result()
+			if err != nil || len(vals) == 0 {
 				continue
 			}
-			if len(vals) == 0 {
+			// отправляем только если свеча новая
+			if vals[0] == lastTs {
 				continue
 			}
-			var candles []interface{}
-			for _, v := range vals {
-				var candle interface{}
-				if err := json.Unmarshal([]byte(v), &candle); err == nil {
-					candles = append(candles, candle)
-				}
+			lastTs = vals[0]
+			var candle interface{}
+			if err := json.Unmarshal([]byte(vals[0]), &candle); err != nil {
+				continue
 			}
-			if len(candles) > 0 {
-				r.hub.Broadcast(hub.Message{
-					Channel: "candles",
-					Symbol:  symbol,
-					Data:    candles,
-				})
-			}
+			r.hub.Broadcast(hub.Message{
+				Channel: "candles",
+				Symbol:  symbol,
+				Data:    candle,
+			})
 		}
 	}
 }
