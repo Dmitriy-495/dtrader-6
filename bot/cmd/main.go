@@ -61,6 +61,17 @@ func main() {
 		account.Leverage,
 	)
 
+	// Пишем баланс в Redis — ws-server транслирует в TUI
+	balPubCtx, cancelBalPub := newCtx()
+	if err := pub.PublishBalance(balPubCtx,
+		account.UnifiedAccountTotal,
+		account.TotalAvailableMargin,
+		account.Leverage,
+	); err != nil {
+		log.Printf("⚠️ Не удалось записать баланс в Redis: %v", err)
+	}
+	cancelBalPub()
+
 	posCtx, cancelPos := newCtx()
 	positions, err := client.GetPositions(posCtx)
 	cancelPos()
@@ -81,7 +92,6 @@ func main() {
 		}
 	}
 
-	// Глобальный контекст — живёт до Ctrl+C / SIGTERM
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -106,7 +116,6 @@ func main() {
 		return nil
 	}
 
-	// Цикл реконнекта — при разрыве WS ждём 5 сек и переподключаемся
 	for {
 		wsClient.ResetDone()
 

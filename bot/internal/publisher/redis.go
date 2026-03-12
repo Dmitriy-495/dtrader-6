@@ -110,3 +110,17 @@ func (p *Publisher) PublishContractStats(ctx context.Context, symbol string, dat
 func (p *Publisher) PublishExchangePing(ctx context.Context) error {
 	return p.rdb.Set(ctx, "system:exchange_ping", time.Now().UnixMilli(), 60*time.Second).Err()
 }
+
+// PublishBalance — записывает баланс аккаунта в Redis при старте бота.
+func (p *Publisher) PublishBalance(ctx context.Context, total, margin, leverage string) error {
+	data := map[string]string{
+		"total":    total,
+		"margin":   margin,
+		"leverage": leverage,
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return p.rdb.Set(ctx, "account:balance", raw, 0).Err()
+}
