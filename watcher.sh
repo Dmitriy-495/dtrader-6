@@ -28,7 +28,8 @@ while true; do
 
         if [ "$REBUILD_BOT" = true ]; then
             echo "🔨 Пересобираем bot..."
-            cd $REPO/bot && go build -o bin/bot ./cmd/main.go
+            cd $REPO/bot
+            go build -o bin/bot ./cmd/main.go
             echo "🔄 Перезапускаем dtrader-bot..."
             sudo systemctl restart dtrader-bot
             echo "✅ $(date) bot обновлён"
@@ -36,9 +37,11 @@ while true; do
 
         if [ "$REBUILD_WS" = true ]; then
             echo "🔨 Пересобираем ws-server..."
-            cd $REPO/ws-server && go build -o bin/ws-server ./cmd/main.go
-            echo "🔄 Перезапускаем dtrader-ws-server..."
-            sudo systemctl restart dtrader-ws-server
+            cd $REPO/ws-server
+            mkdir -p bin
+            go build -o bin/ws-server ./cmd/main.go
+            echo "🔄 Перезапускаем dtrader-ws..."
+            sudo systemctl restart dtrader-ws
             echo "✅ $(date) ws-server обновлён"
         fi
 
