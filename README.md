@@ -4,7 +4,7 @@ Multi-timeframe crypto trading bot for Gate.io
 
 ## Architecture
 
-- `bot`       — Gate.io WebSocket → Redis
+- `bot` — Gate.io WebSocket → Redis
 - `ws-server` — Redis → WebSocket clients
 - `ws-client` — temporary data viewer (Node.js)
 
@@ -18,5 +18,7 @@ Multi-timeframe crypto trading bot for Gate.io
 ## Timeframes
 
 - HTF 24m — trend & permission
-- MTF  8m — setup & volume
-- LTF  1m — sniper entry
+- MTF 8m — setup & volume
+- LTF 1m — sniper entry
+
+# alll

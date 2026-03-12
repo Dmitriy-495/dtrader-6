@@ -1,19 +1,19 @@
 # =============================================================================
-# DTrader 6 — WS-Server Service Configuration
+# DTrader 6 — WS Server Configuration
 # =============================================================================
 
-# Настройки приложения
 app:
   name: dtrader-6-ws-server
-  env: development         # development | production
+  env: development
 
-# Настройки WebSocket сервера
 server:
-  host: 0.0.0.0            # слушаем на всех интерфейсах
-  port: 1971               # порт подключения клиентов
-  ping_interval: 10s       # интервал ping/pong с клиентами
+  port: 9000
 
-# Настройки Redis
+symbols:
+  - BTC_USDT
+  - ETH_USDT
+  - SOL_USDT
+
 redis:
   host: localhost
   port: 6379
