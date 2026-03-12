@@ -155,7 +155,7 @@ type Candle struct {
 type Liquidation struct {
 	Price    float64 `json:"price"`
 	Size     string  `json:"size"`
-	TimeMs   int64   `json:"time_ms"`
+	TimeMs   int64   `json:"time"`
 	Contract string  `json:"contract"`
 }
 
