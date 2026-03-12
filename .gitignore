@@ -22,3 +22,4 @@ Thumbs.db
 node_modules/
 dist/
 CHECKPOINT_*.md
+*.tar.gz
