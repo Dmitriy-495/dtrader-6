@@ -16,6 +16,13 @@ while true; do
 
         git pull origin master
 
+        # Если обновился сам watcher — перезапускаем себя через systemd
+        if echo "$CHANGED" | grep -q "^watcher.sh"; then
+            echo "🔄 watcher.sh обновлён — перезапускаем сервис..."
+            sudo systemctl restart dtrader-watcher
+            exit 0
+        fi
+
         REBUILD_BOT=false
         REBUILD_WS=false
 
