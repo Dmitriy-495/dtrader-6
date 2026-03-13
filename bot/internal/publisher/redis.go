@@ -107,8 +107,8 @@ func (p *Publisher) PublishContractStats(ctx context.Context, symbol string, dat
 
 // PublishExchangePing — записывает timestamp последнего pong от биржи.
 // ws-server читает это значение и транслирует клиентам как EXCH индикатор.
-func (p *Publisher) PublishExchangePing(ctx context.Context) error {
-	return p.rdb.Set(ctx, "system:exchange_ping", time.Now().UnixMilli(), 60*time.Second).Err()
+func (p *Publisher) PublishExchangePing(ctx context.Context, latencyMs int64) error {
+	return p.rdb.Set(ctx, "system:exchange_ping", latencyMs, 60*time.Second).Err()
 }
 
 // PublishBalance — записывает баланс аккаунта в Redis при старте бота.

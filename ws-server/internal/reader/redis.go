@@ -259,7 +259,7 @@ type Balance struct {
 // SystemMsg — служебное сообщение heartbeat от ws-server к TUI
 type SystemMsg struct {
 	ServerTs   int64   `json:"server_ts"`   // timestamp ws-server (для SERV latency)
-	ExchangeTs int64   `json:"exchange_ts"` // timestamp последнего pong от биржи
+	ExchangeLatMs int64 `json:"exchange_lat_ms"` // latency ping-pong биржи в мс
 	Balance    Balance `json:"balance"`     // текущий баланс аккаунта
 }
 
@@ -303,7 +303,7 @@ func (r *Reader) broadcastSystem(ctx context.Context) {
 		Symbol:  "",
 		Data: SystemMsg{
 			ServerTs:   time.Now().UnixMilli(),
-			ExchangeTs: exchTs,
+			ExchangeLatMs: exchTs,
 			Balance:    balance,
 		},
 	})

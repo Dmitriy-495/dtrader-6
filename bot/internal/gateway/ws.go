@@ -42,6 +42,7 @@ type WSClient struct {
 	writeMu sync.Mutex
 	pub     *publisher.Publisher
 	done    chan struct{}
+	pingTs  int64          // timestamp последнего отправленного ping (unix ms)
 }
 
 func NewWSClient(url, apiKey, secret string, pub *publisher.Publisher) *WSClient {
@@ -88,6 +89,7 @@ func (c *WSClient) Connect(ctx context.Context) error {
 }
 
 func (c *WSClient) sendPing() error {
+	c.pingTs = time.Now().UnixMilli()
 	return c.writeJSON(WSRequest{
 		Time:    utils.NowUnix(),
 		Channel: "futures.ping",
@@ -216,8 +218,9 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			continue
 		}
 		if msg.Channel == "futures.pong" {
+			latencyMs := time.Now().UnixMilli() - c.pingTs
 			if c.pub != nil {
-				_ = c.pub.PublishExchangePing(ctx)
+				_ = c.pub.PublishExchangePing(ctx, latencyMs)
 			}
 			continue
 		}
