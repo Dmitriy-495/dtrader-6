@@ -107,8 +107,14 @@ func (p *Publisher) PublishContractStats(ctx context.Context, symbol string, dat
 
 // PublishExchangePing — записывает timestamp последнего pong от биржи.
 // ws-server читает это значение и транслирует клиентам как EXCH индикатор.
-func (p *Publisher) PublishExchangePing(ctx context.Context, latencyMs int64) error {
-	return p.rdb.Set(ctx, "system:exchange_ping", latencyMs, 60*time.Second).Err()
+// PublishExchangePing — записывает текущую латентность ping-pong и EMA в Redis.
+// current — текущий RTT в ms, emaMs — экспоненциальная скользящая средняя.
+// PublishExchangePing — записывает текущую латентность ping-pong и EMA в Redis.
+// current — текущий RTT в ms, emaMs — экспоненциальная скользящая средняя.
+func (p *Publisher) PublishExchangePing(ctx context.Context, current, emaMs int64) error {
+	data := map[string]int64{"current": current, "ema": emaMs}
+	raw, _ := json.Marshal(data)
+	return p.rdb.Set(ctx, "system:exchange_ping", raw, 60*time.Second).Err()
 }
 
 // PublishBalance — записывает баланс аккаунта в Redis при старте бота.
@@ -124,3 +130,5 @@ func (p *Publisher) PublishBalance(ctx context.Context, total, margin, leverage 
 	}
 	return p.rdb.Set(ctx, "account:balance", raw, 0).Err()
 }
+// PublishExchangePingV2 — временная заглушка, используем обновлённую версию
+// PublishExchangePingV2 — временная заглушка, используем обновлённую версию

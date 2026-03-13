@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -13,6 +14,11 @@ import (
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/publisher"
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/utils"
 )
+
+// alpha — коэффициент сглаживания EMA для 100 периодов
+// α = 2 / (N + 1) = 2 / 101 ≈ 0.0198
+// чем меньше α — тем плавнее реакция на новые значения
+const emaAlpha = 2.0 / (100.0 + 1.0)
 
 type WSRequest struct {
 	Time    int64    `json:"time"`
@@ -42,7 +48,8 @@ type WSClient struct {
 	writeMu sync.Mutex
 	pub     *publisher.Publisher
 	done    chan struct{}
-	pingTs  int64          // timestamp последнего отправленного ping (unix ms)
+	pingTs  int64   // timestamp последнего отправленного ping (unix ms)
+	emaLat  float64 // экспоненциальная скользящая средняя латентности (ms)
 }
 
 func NewWSClient(url, apiKey, secret string, pub *publisher.Publisher) *WSClient {
@@ -89,6 +96,7 @@ func (c *WSClient) Connect(ctx context.Context) error {
 }
 
 func (c *WSClient) sendPing() error {
+	// Запоминаем момент отправки — при получении pong посчитаем RTT
 	c.pingTs = time.Now().UnixMilli()
 	return c.writeJSON(WSRequest{
 		Time:    utils.NowUnix(),
@@ -101,7 +109,8 @@ func (c *WSClient) RunPingLoop(ctx context.Context) {
 		log.Printf("❌ Первый ping не удался: %v", err)
 		return
 	}
-	ticker := time.NewTicker(20 * time.Second)
+	// Уменьшили интервал до 10s для более точного отслеживания латентности
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -155,10 +164,10 @@ type Candle struct {
 }
 
 type Liquidation struct {
-	Price    string  `json:"price"`
-	Size     string  `json:"size"`
-	TimeMs   int64   `json:"time"`
-	Contract string  `json:"contract"`
+	Price    string `json:"price"`
+	Size     string `json:"size"`
+	TimeMs   int64  `json:"time"`
+	Contract string `json:"contract"`
 }
 
 type ContractStats struct {
@@ -177,20 +186,31 @@ type ContractStats struct {
 	MarkPrice       json.Number `json:"mark_price"`
 }
 
-// parseLiquidations парсит ликвидации — биржа шлёт то массив то объект
+// parseLiquidations — биржа шлёт то массив то одиночный объект
 func parseLiquidations(raw json.RawMessage) ([]Liquidation, error) {
-	// пробуем массив
 	var liqs []Liquidation
 	if err := json.Unmarshal(raw, &liqs); err == nil {
 		return liqs, nil
 	}
-	// пробуем одиночный объект
 	var liq Liquidation
 	if err := json.Unmarshal(raw, &liq); err == nil {
 		return []Liquidation{liq}, nil
 	}
-	log.Printf("⚠️ liquidates raw: %s", string(raw))
 	return nil, fmt.Errorf("не удалось распарсить ликвидацию")
+}
+
+// updateEMA обновляет экспоненциальную скользящую среднюю латентности.
+// При первом значении инициализируем EMA текущим значением.
+// Формула: EMA = current × α + prev_EMA × (1 - α)
+func (c *WSClient) updateEMA(latencyMs int64) {
+	current := float64(latencyMs)
+	if c.emaLat == 0 {
+		// Первое измерение — инициализируем EMA текущим значением
+		c.emaLat = current
+	} else {
+		// EMA = новое × α + старое × (1 - α)
+		c.emaLat = current*emaAlpha + c.emaLat*(1-emaAlpha)
+	}
 }
 
 func (c *WSClient) ReadLoop(ctx context.Context) {
@@ -218,9 +238,13 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			continue
 		}
 		if msg.Channel == "futures.pong" {
+			// Считаем RTT и обновляем EMA
 			latencyMs := time.Now().UnixMilli() - c.pingTs
+			c.updateEMA(latencyMs)
+			// Пишем текущую латентность и EMA в Redis
 			if c.pub != nil {
-				_ = c.pub.PublishExchangePing(ctx, latencyMs)
+				emaMs := int64(math.Round(c.emaLat))
+				_ = c.pub.PublishExchangePing(ctx, latencyMs, emaMs)
 			}
 			continue
 		}

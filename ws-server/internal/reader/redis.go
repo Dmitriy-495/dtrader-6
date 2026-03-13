@@ -13,6 +13,8 @@ import (
 	"github.com/Dmitriy-495/dtrader-6/ws-server/internal/hub"
 )
 
+// Reader — читает данные из Redis и транслирует клиентам через Hub.
+// Каждый канал (trades, orderbook, stats, candles, liquidations) — отдельная горутина.
 type Reader struct {
 	rdb     *redis.Client
 	hub     *hub.Hub
@@ -23,6 +25,7 @@ func New(rdb *redis.Client, h *hub.Hub, symbols []string) *Reader {
 	return &Reader{rdb: rdb, hub: h, symbols: symbols}
 }
 
+// RunAll запускает горутины чтения для всех символов
 func (r *Reader) RunAll(ctx context.Context) {
 	for _, symbol := range r.symbols {
 		go r.readTrades(ctx, symbol)
@@ -34,6 +37,9 @@ func (r *Reader) RunAll(ctx context.Context) {
 	log.Printf("📡 Reader: запущены горутины для %d символов", len(r.symbols))
 }
 
+// TradeAgg — агрегированные трейды за интервал 500ms.
+// Вместо потока тиков клиент получает сводку:
+// количество сделок, суммарный объём, направление давления.
 type TradeAgg struct {
 	Symbol    string  `json:"symbol"`
 	BuyVol    float64 `json:"buy_vol"`
@@ -44,6 +50,7 @@ type TradeAgg struct {
 	Ts        int64   `json:"ts"`
 }
 
+// readTrades читает трейды из Stream и агрегирует за 500ms.
 func (r *Reader) readTrades(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:trades:%s", symbol)
 	lastID := "$"
@@ -51,6 +58,7 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 	var mu sync.Mutex
 	agg := &TradeAgg{Symbol: symbol}
 
+	// Горутина-отправщик: каждые 500ms отправляет агрегат если есть данные
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
@@ -78,6 +86,7 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 		}
 	}()
 
+	// Основной цикл: читаем тики из Redis Stream
 	for {
 		if ctx.Err() != nil {
 			return
@@ -119,6 +128,7 @@ func (r *Reader) readTrades(ctx context.Context, symbol string) {
 	}
 }
 
+// readLiquidations — ликвидации редкие и важные, отправляем каждую без агрегации
 func (r *Reader) readLiquidations(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:liquidations:%s", symbol)
 	lastID := "$"
@@ -155,6 +165,7 @@ func (r *Reader) readLiquidations(ctx context.Context, symbol string) {
 	}
 }
 
+// pollOrderBook читает стакан раз в 1s — достаточно для TUI
 func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:orderbook:%s", symbol)
 	ticker := time.NewTicker(time.Second)
@@ -184,6 +195,7 @@ func (r *Reader) pollOrderBook(ctx context.Context, symbol string) {
 	}
 }
 
+// pollStats отправляет только при изменении данных
 func (r *Reader) pollStats(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:stats:%s", symbol)
 	ticker := time.NewTicker(5 * time.Second)
@@ -218,6 +230,7 @@ func (r *Reader) pollStats(ctx context.Context, symbol string) {
 	}
 }
 
+// pollCandles отправляет только когда появляется новая свеча
 func (r *Reader) pollCandles(ctx context.Context, symbol string) {
 	key := fmt.Sprintf("market:candles:1m:%s", symbol)
 	ticker := time.NewTicker(10 * time.Second)
@@ -256,21 +269,27 @@ type Balance struct {
 	Leverage string `json:"leverage"`
 }
 
+// ExchangePing — структура латентности биржи
+type ExchangePing struct {
+	Current int64 `json:"current"` // текущий RTT в мс
+	Ema     int64 `json:"ema"`     // EMA за ~100 измерений
+}
+
 // SystemMsg — служебное сообщение heartbeat от ws-server к TUI
 type SystemMsg struct {
-	ServerTs   int64   `json:"server_ts"`   // timestamp ws-server (для SERV latency)
-	ExchangeLatMs int64 `json:"exchange_lat_ms"` // latency ping-pong биржи в мс
-	Balance    Balance `json:"balance"`     // текущий баланс аккаунта
+	ServerTs    int64        `json:"server_ts"`    // timestamp ws-server (для SERV latency)
+	ExchangePing ExchangePing `json:"exchange_ping"` // латентность биржи current + EMA
+	Balance     Balance      `json:"balance"`       // текущий баланс аккаунта
 }
 
 // RunSystem запускает горутину heartbeat — шлёт system сообщение каждые 20s.
+// Также отправляет сразу при старте не дожидаясь первого тика.
 func (r *Reader) RunSystem(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
 		log.Println("📡 Reader system: heartbeat запущен (интервал 20s)")
 
-		// Отправляем сразу при старте не дожидаясь первого тика
 		r.broadcastSystem(ctx)
 
 		for {
@@ -284,15 +303,15 @@ func (r *Reader) RunSystem(ctx context.Context) {
 	}()
 }
 
-// broadcastSystem читает данные из Redis и шлёт system сообщение
+// broadcastSystem читает данные из Redis и шлёт system сообщение всем клиентам
 func (r *Reader) broadcastSystem(ctx context.Context) {
-	// Читаем exchange ping
-	var exchTs int64
+	// Читаем латентность биржи — JSON {"current": X, "ema": Y}
+	var exchPing ExchangePing
 	if val, err := r.rdb.Get(ctx, "system:exchange_ping").Result(); err == nil {
-		exchTs, _ = strconv.ParseInt(val, 10, 64)
+		_ = json.Unmarshal([]byte(val), &exchPing)
 	}
 
-	// Читаем баланс
+	// Читаем баланс аккаунта
 	var balance Balance
 	if val, err := r.rdb.Get(ctx, "account:balance").Result(); err == nil {
 		_ = json.Unmarshal([]byte(val), &balance)
@@ -302,9 +321,9 @@ func (r *Reader) broadcastSystem(ctx context.Context) {
 		Channel: "system",
 		Symbol:  "",
 		Data: SystemMsg{
-			ServerTs:   time.Now().UnixMilli(),
-			ExchangeLatMs: exchTs,
-			Balance:    balance,
+			ServerTs:    time.Now().UnixMilli(),
+			ExchangePing: exchPing,
+			Balance:     balance,
 		},
 	})
 }
