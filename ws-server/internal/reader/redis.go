@@ -286,9 +286,9 @@ type SystemMsg struct {
 // Также отправляет сразу при старте не дожидаясь первого тика.
 func (r *Reader) RunSystem(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(20 * time.Second)
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
-		log.Println("📡 Reader system: heartbeat запущен (интервал 20s)")
+		log.Println("📡 Reader system: heartbeat запущен (интервал 10s)")
 
 		r.broadcastSystem(ctx)
 
