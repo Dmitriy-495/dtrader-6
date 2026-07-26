@@ -3,6 +3,7 @@ package gateway
 import (
 	"fmt"
 	"log"
+	"strconv"
 
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/utils"
 )
@@ -23,22 +24,28 @@ func (c *WSClient) SubscribeTrades(symbols []string) error {
 	return nil
 }
 
-// SubscribeOrderBookUpdate — инкрементальный стакан 100ms глубина 20
+// SubscribeOrderBookUpdate — инкрементальный стакан 100ms
 // эффективнее чем order_book — шлёт только изменения, не весь стакан
 // best bid/ask = первый уровень обновлённого стакана
-func (c *WSClient) SubscribeOrderBookUpdate(symbols []string) error {
+//
+// depth — глубина стакана (количество уровней), берётся из
+// config.yaml (orderbook.depth), а не захардкожена здесь — так
+// можно поменять глубину без пересборки бинарника, просто правкой
+// config.yaml.
+func (c *WSClient) SubscribeOrderBookUpdate(symbols []string, depth int) error {
+	depthStr := strconv.Itoa(depth)
 	for _, symbol := range symbols {
 		msg := WSRequest{
 			Time:    utils.NowUnix(),
 			Channel: "futures.order_book_update",
 			Event:   "subscribe",
 			// symbol, частота обновления, глубина
-			Payload: []string{symbol, "100ms", "20"},
+			Payload: []string{symbol, "100ms", depthStr},
 		}
 		if err := c.writeJSON(msg); err != nil {
 			return fmt.Errorf("subscribe order_book_update %s: %w", symbol, err)
 		}
-		log.Printf("📖 [order_book_update] подписка отправлена: %s 100ms depth=20", symbol)
+		log.Printf("📖 [order_book_update] подписка отправлена: %s 100ms depth=%d", symbol, depth)
 	}
 	return nil
 }

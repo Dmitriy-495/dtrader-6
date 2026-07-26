@@ -26,7 +26,10 @@ func main() {
 	fmt.Printf("   Символы: %v\n", cfg.Symbols)
 	fmt.Printf("   Redis:   %s:%d\n", cfg.Redis.Host, cfg.Redis.Port)
 
-	pub := publisher.New(cfg.Redis.Host, cfg.Redis.Port, cfg.Redis.Password)
+	pub := publisher.New(
+		cfg.Redis.Host, cfg.Redis.Port, cfg.Redis.Password,
+		cfg.Storage.Trades, cfg.Storage.Liquidations, cfg.Storage.Candles1m,
+	)
 	pingCtx, cancelPing := context.WithTimeout(context.Background(), gateway.RequestTimeout)
 	if err := pub.Ping(pingCtx); err != nil {
 		log.Fatalf("❌ Redis недоступен: %v", err)
@@ -97,11 +100,16 @@ func main() {
 
 	wsClient := gateway.NewWSClient(cfg.Exchange.WsURL, cfg.Secrets.APIKey, cfg.Secrets.APISecret, pub)
 
+	// reconnectInterval — пауза перед повторной попыткой подключения,
+	// берётся из config.yaml (exchange.reconnect_interval), а не
+	// захардкожена — используется во всех трёх местах реконнекта ниже.
+	reconnectInterval := cfg.Exchange.ReconnectIntervalDuration()
+
 	subscribeAll := func() error {
 		if err := wsClient.SubscribeTrades(cfg.Symbols); err != nil {
 			return fmt.Errorf("trades: %w", err)
 		}
-		if err := wsClient.SubscribeOrderBookUpdate(cfg.Symbols); err != nil {
+		if err := wsClient.SubscribeOrderBookUpdate(cfg.Symbols, cfg.Orderbook.Depth); err != nil {
 			return fmt.Errorf("order_book_update: %w", err)
 		}
 		if err := wsClient.SubscribeCandlesticks(cfg.Symbols); err != nil {
@@ -123,25 +131,25 @@ func main() {
 			if ctx.Err() != nil {
 				break
 			}
-			log.Printf("❌ WS коннект не удался: %v — повтор через 5 сек", err)
+			log.Printf("❌ WS коннект не удался: %v — повтор через %s", err, reconnectInterval)
 			select {
 			case <-ctx.Done():
 				goto shutdown
-			case <-time.After(5 * time.Second):
+			case <-time.After(reconnectInterval):
 				continue
 			}
 		}
 
 		go wsClient.ReadLoop(ctx)
-		go wsClient.RunPingLoop(ctx)
+		go wsClient.RunPingLoop(ctx, cfg.Exchange.PingIntervalDuration())
 
 		if err := subscribeAll(); err != nil {
-			log.Printf("❌ Ошибка подписки: %v — реконнект через 5 сек", err)
+			log.Printf("❌ Ошибка подписки: %v — реконнект через %s", err, reconnectInterval)
 			wsClient.Close()
 			select {
 			case <-ctx.Done():
 				goto shutdown
-			case <-time.After(5 * time.Second):
+			case <-time.After(reconnectInterval):
 				continue
 			}
 		}
@@ -152,12 +160,12 @@ func main() {
 		case <-ctx.Done():
 			goto shutdown
 		case <-wsClient.Done():
-			log.Println("🔄 WS разорван. Реконнект через 5 сек...")
+			log.Printf("🔄 WS разорван. Реконнект через %s...", reconnectInterval)
 			wsClient.Close()
 			select {
 			case <-ctx.Done():
 				goto shutdown
-			case <-time.After(5 * time.Second):
+			case <-time.After(reconnectInterval):
 			}
 		}
 	}

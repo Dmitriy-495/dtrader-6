@@ -1,218 +1,30 @@
+// Этот файл отвечает за главный цикл чтения сообщений от Gate.io.
+// Управление соединением — в connection.go, ping/pong и EMA — в pingloop.go,
+// структуры протокола — в protocol.go, подписки на каналы — в subscribe.go,
+// разбор конкретных типов рыночных данных — в parser.go.
+//
+// ReadLoop специально сделан "тонким": он только читает байты, распаковывает
+// конверт (WSResponse) и решает, КОМУ отдать Result — сам не занимается
+// разбором Trade/Candle/OrderBook и т.д., это уже дело parser.go.
 package gateway
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"math"
-	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/Dmitriy-495/dtrader-6/bot/internal/publisher"
-	"github.com/Dmitriy-495/dtrader-6/bot/internal/utils"
 )
 
-// alpha — коэффициент сглаживания EMA для 100 периодов
-// α = 2 / (N + 1) = 2 / 101 ≈ 0.0198
-// чем меньше α — тем плавнее реакция на новые значения
-const emaAlpha = 2.0 / (100.0 + 1.0)
-
-type WSRequest struct {
-	Time    int64    `json:"time"`
-	Channel string   `json:"channel"`
-	Event   string   `json:"event,omitempty"`
-	Payload []string `json:"payload,omitempty"`
-}
-
-type WSResponse struct {
-	Time    int64           `json:"time"`
-	Channel string          `json:"channel"`
-	Event   string          `json:"event,omitempty"`
-	Error   *WSError        `json:"error,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-}
-
-type WSError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-type WSClient struct {
-	url     string
-	apiKey  string
-	secret  string
-	conn    *websocket.Conn
-	writeMu sync.Mutex
-	pub     *publisher.Publisher
-	done    chan struct{}
-	pingTs  int64   // timestamp последнего отправленного ping (unix ms)
-	emaLat  float64 // экспоненциальная скользящая средняя латентности (ms)
-}
-
-func NewWSClient(url, apiKey, secret string, pub *publisher.Publisher) *WSClient {
-	return &WSClient{
-		url:    url,
-		apiKey: apiKey,
-		secret: secret,
-		pub:    pub,
-		done:   make(chan struct{}, 1),
-	}
-}
-
-func (c *WSClient) Done() <-chan struct{} {
-	return c.done
-}
-
-func (c *WSClient) ResetDone() {
-	c.done = make(chan struct{}, 1)
-}
-
-func (c *WSClient) writeJSON(v interface{}) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.WriteJSON(v)
-}
-
-func (c *WSClient) writeMessage(messageType int, data []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.WriteMessage(messageType, data)
-}
-
-func (c *WSClient) Connect(ctx context.Context) error {
-	header := http.Header{
-		"X-Gate-Size-Decimal": []string{"1"},
-	}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.url, header)
-	if err != nil {
-		return fmt.Errorf("WS коннект не удался: %w", err)
-	}
-	c.conn = conn
-	log.Printf("✅ WS подключён: %s", c.url)
-	return nil
-}
-
-func (c *WSClient) sendPing() error {
-	// Запоминаем момент отправки — при получении pong посчитаем RTT
-	c.pingTs = time.Now().UnixMilli()
-	return c.writeJSON(WSRequest{
-		Time:    utils.NowUnix(),
-		Channel: "futures.ping",
-	})
-}
-
-func (c *WSClient) RunPingLoop(ctx context.Context) {
-	if err := c.sendPing(); err != nil {
-		log.Printf("❌ Первый ping не удался: %v", err)
-		return
-	}
-	// Уменьшили интервал до 10s для более точного отслеживания латентности
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-c.done:
-			return
-		case <-ticker.C:
-			if err := c.sendPing(); err != nil {
-				log.Printf("❌ Ошибка ping: %v", err)
-				return
-			}
-		}
-	}
-}
-
-type Trade struct {
-	ID           int64  `json:"id"`
-	Contract     string `json:"contract"`
-	Size         string `json:"size"`
-	Price        string `json:"price"`
-	CreateTime   int64  `json:"create_time"`
-	CreateTimeMs int64  `json:"create_time_ms"`
-	IsInternal   bool   `json:"is_internal"`
-}
-
-type OBLevel struct {
-	Price string `json:"p"`
-	Size  string `json:"s"`
-}
-
-type OrderBookUpdate struct {
-	T      int64     `json:"t"`
-	S      string    `json:"s"`
-	U      int64     `json:"u"`
-	FirstU int64     `json:"U"`
-	Bids   []OBLevel `json:"b"`
-	Asks   []OBLevel `json:"a"`
-}
-
-type Candle struct {
-	T      int64  `json:"t"`
-	Open   string `json:"o"`
-	Close  string `json:"c"`
-	High   string `json:"h"`
-	Low    string `json:"l"`
-	Volume string `json:"v"`
-	Name   string `json:"n"`
-	Amount string `json:"a"`
-	Window bool   `json:"w"`
-}
-
-type Liquidation struct {
-	Price    string `json:"price"`
-	Size     string `json:"size"`
-	TimeMs   int64  `json:"time"`
-	Contract string `json:"contract"`
-}
-
-type ContractStats struct {
-	Time            int64       `json:"time"`
-	Contract        string      `json:"contract"`
-	OpenInterest    json.Number `json:"open_interest"`
-	OpenInterestUSD json.Number `json:"open_interest_usd"`
-	LsrTaker        json.Number `json:"lsr_taker"`
-	LsrAccount      json.Number `json:"lsr_account"`
-	LongLiqSize     json.Number `json:"long_liq_size"`
-	ShortLiqSize    json.Number `json:"short_liq_size"`
-	LongLiqUSD      json.Number `json:"long_liq_usd"`
-	ShortLiqUSD     json.Number `json:"short_liq_usd"`
-	TopLsrAccount   json.Number `json:"top_lsr_account"`
-	TopLsrSize      json.Number `json:"top_lsr_size"`
-	MarkPrice       json.Number `json:"mark_price"`
-}
-
-// parseLiquidations — биржа шлёт то массив то одиночный объект
-func parseLiquidations(raw json.RawMessage) ([]Liquidation, error) {
-	var liqs []Liquidation
-	if err := json.Unmarshal(raw, &liqs); err == nil {
-		return liqs, nil
-	}
-	var liq Liquidation
-	if err := json.Unmarshal(raw, &liq); err == nil {
-		return []Liquidation{liq}, nil
-	}
-	return nil, fmt.Errorf("не удалось распарсить ликвидацию")
-}
-
-// updateEMA обновляет экспоненциальную скользящую среднюю латентности.
-// При первом значении инициализируем EMA текущим значением.
-// Формула: EMA = current × α + prev_EMA × (1 - α)
-func (c *WSClient) updateEMA(latencyMs int64) {
-	current := float64(latencyMs)
-	if c.emaLat == 0 {
-		// Первое измерение — инициализируем EMA текущим значением
-		c.emaLat = current
-	} else {
-		// EMA = новое × α + старое × (1 - α)
-		c.emaLat = current*emaAlpha + c.emaLat*(1-emaAlpha)
-	}
-}
-
+// ReadLoop — главный цикл чтения сообщений от Gate.io WebSocket.
+// Должен запускаться в отдельной горутине (go wsClient.ReadLoop(ctx))
+// параллельно с RunPingLoop.
+//
+// Цикл работает, пока conn.ReadMessage() не вернёт ошибку — это
+// происходит либо при отмене ctx (плановое завершение), либо при
+// разрыве соединения (сеть, биржа закрыла коннект и т.д.).
 func (c *WSClient) ReadLoop(ctx context.Context) {
 	signalDone := func() {
 		select {
@@ -232,19 +44,26 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			signalDone()
 			return
 		}
+
 		var msg WSResponse
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			log.Printf("⚠️ Не удалось разобрать: %s", string(raw))
 			continue
 		}
+
+		// --- Служебные случаи (не рыночные данные) ---
+
 		if msg.Channel == "futures.pong" {
-			// Считаем RTT и обновляем EMA
+			// Считаем RTT и обновляем EMA (updateEMA — см. pingloop.go)
 			latencyMs := time.Now().UnixMilli() - c.pingTs
 			c.updateEMA(latencyMs)
 			// Пишем текущую латентность и EMA в Redis
 			if c.pub != nil {
 				emaMs := int64(math.Round(c.emaLat))
-				_ = c.pub.PublishExchangePing(ctx, latencyMs, emaMs)
+				if err := c.pub.PublishExchangePing(ctx, latencyMs, emaMs); err != nil {
+					log.Printf("⚠️ publish exchange_ping failed: err=%v", err)
+					c.pub.Metrics.IncDropped()
+				}
 			}
 			continue
 		}
@@ -257,84 +76,20 @@ func (c *WSClient) ReadLoop(ctx context.Context) {
 			log.Printf("✅ Подписка подтверждена: channel=%s", msg.Channel)
 			continue
 		}
+
+		// --- Рыночные данные: отдаём в parser.go по каналу ---
+
 		switch msg.Channel {
 		case "futures.trades":
-			var trades []Trade
-			if err := json.Unmarshal(msg.Result, &trades); err != nil {
-				log.Printf("⚠️ trades parse error: %v", err)
-				continue
-			}
-			for _, t := range trades {
-				if t.IsInternal {
-					continue
-				}
-				if c.pub != nil {
-					_ = c.pub.PublishTrade(ctx, t.Contract, map[string]interface{}{
-						"id":    t.ID,
-						"price": t.Price,
-						"size":  t.Size,
-						"ts":    t.CreateTimeMs,
-					})
-				}
-			}
+			c.handleTrades(ctx, msg.Result)
 		case "futures.order_book_update":
-			var ob OrderBookUpdate
-			if err := json.Unmarshal(msg.Result, &ob); err != nil {
-				log.Printf("⚠️ order_book_update parse error: %v", err)
-				continue
-			}
-			if c.pub != nil {
-				_ = c.pub.PublishOrderBook(ctx, ob.S, ob)
-			}
+			c.handleOrderBook(ctx, msg.Result)
 		case "futures.candlesticks":
-			var candles []Candle
-			if err := json.Unmarshal(msg.Result, &candles); err != nil {
-				log.Printf("⚠️ candlesticks parse error: %v", err)
-				continue
-			}
-			for _, candle := range candles {
-				if candle.Window && c.pub != nil {
-					symbol := candle.Name
-					if len(symbol) > 3 {
-						symbol = symbol[3:]
-					}
-					_ = c.pub.PublishCandle(ctx, symbol, candle)
-				}
-			}
+			c.handleCandles(ctx, msg.Result)
 		case "futures.public_liquidates":
-			liqs, err := parseLiquidations(msg.Result)
-			if err != nil {
-				log.Printf("⚠️ liquidates parse error: %v", err)
-				continue
-			}
-			for _, liq := range liqs {
-				if c.pub != nil {
-					_ = c.pub.PublishLiquidation(ctx, liq.Contract, map[string]interface{}{
-						"price":   liq.Price,
-						"size":    liq.Size,
-						"time_ms": liq.TimeMs,
-					})
-				}
-			}
+			c.handleLiquidations(ctx, msg.Result)
 		case "futures.contract_stats":
-			var stats ContractStats
-			if err := json.Unmarshal(msg.Result, &stats); err != nil {
-				log.Printf("⚠️ contract_stats parse error: %v", err)
-				continue
-			}
-			if c.pub != nil {
-				_ = c.pub.PublishContractStats(ctx, stats.Contract, stats)
-			}
+			c.handleContractStats(ctx, msg.Result)
 		}
-	}
-}
-
-func (c *WSClient) Close() {
-	if c.conn != nil {
-		c.writeMessage(
-			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		)
-		c.conn.Close()
 	}
 }

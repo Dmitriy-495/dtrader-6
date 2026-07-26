@@ -10,23 +10,45 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	maxTrades       = 1000
-	maxLiquidations = 500
-	maxCandles      = 200
-)
-
+// Publisher — единственная точка записи рыночных данных в Redis.
+//
+// maxTrades/maxLiquidations/maxCandles — лимиты скользящих окон хранения
+// (сколько последних записей держим в Redis на символ), приходят из
+// config.yaml (секция storage) через New() — раньше были захардкожены
+// константами прямо в этом файле, теперь их можно менять без пересборки.
+//
+// Metrics — публичное поле (не приватное!), потому что parser.go
+// (пакет gateway) должен уметь вызывать pub.Metrics.IncDropped()
+// напрямую при неудачной публикации, без лишней обёртки-метода
+// в самом Publisher.
 type Publisher struct {
-	rdb *redis.Client
+	rdb     *redis.Client
+	Metrics *Metrics
+
+	maxTrades       int64
+	maxLiquidations int64
+	maxCandles      int64
 }
 
-func New(host string, port int, password string) *Publisher {
+// New создаёт Publisher с новым, обнулённым счётчиком метрик.
+//
+// maxTrades/maxLiquidations/maxCandles — лимиты хранения из
+// config.yaml (storage.trades, storage.liquidations, storage.candles_1m).
+// Config.validate() уже гарантирует, что все три положительны — здесь
+// дополнительных проверок не делаем.
+func New(host string, port int, password string, maxTrades, maxLiquidations, maxCandles int) *Publisher {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", host, port),
 		Password: password,
 		DB:       0,
 	})
-	return &Publisher{rdb: rdb}
+	return &Publisher{
+		rdb:             rdb,
+		Metrics:         NewMetrics(),
+		maxTrades:       int64(maxTrades),
+		maxLiquidations: int64(maxLiquidations),
+		maxCandles:      int64(maxCandles),
+	}
 }
 
 func (p *Publisher) Ping(ctx context.Context) error {
@@ -41,7 +63,7 @@ func (p *Publisher) PublishTrade(ctx context.Context, symbol string, data map[st
 	key := fmt.Sprintf("market:trades:%s", symbol)
 	err := p.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: key,
-		MaxLen: maxTrades,
+		MaxLen: p.maxTrades,
 		Approx: true,
 		Values: data,
 	}).Err()
@@ -71,7 +93,7 @@ func (p *Publisher) PublishCandle(ctx context.Context, symbol string, data inter
 	}
 	pipe := p.rdb.Pipeline()
 	pipe.RPush(ctx, key, raw)
-	pipe.LTrim(ctx, key, -maxCandles, -1)
+	pipe.LTrim(ctx, key, -p.maxCandles, -1)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("PublishCandle %s: %w", symbol, err)
 	}
@@ -83,7 +105,7 @@ func (p *Publisher) PublishLiquidation(ctx context.Context, symbol string, data 
 	key := fmt.Sprintf("market:liquidations:%s", symbol)
 	err := p.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: key,
-		MaxLen: maxLiquidations,
+		MaxLen: p.maxLiquidations,
 		Approx: true,
 		Values: data,
 	}).Err()
@@ -105,16 +127,31 @@ func (p *Publisher) PublishContractStats(ctx context.Context, symbol string, dat
 	return nil
 }
 
-// PublishExchangePing — записывает timestamp последнего pong от биржи.
-// ws-server читает это значение и транслирует клиентам как EXCH индикатор.
-// PublishExchangePing — записывает текущую латентность ping-pong и EMA в Redis.
+// PublishExchangePing записывает текущую латентность ping-pong и EMA в Redis.
 // current — текущий RTT в ms, emaMs — экспоненциальная скользящая средняя.
-// PublishExchangePing — записывает текущую латентность ping-pong и EMA в Redis.
-// current — текущий RTT в ms, emaMs — экспоненциальная скользящая средняя.
+// TTL 60 секунд: если бот упадёт, значение само "протухнет" в Redis
+// через минуту — ws-server и TUI увидят отсутствие данных, а не
+// устаревшее "последнее известное" значение, выданное за живое.
 func (p *Publisher) PublishExchangePing(ctx context.Context, current, emaMs int64) error {
 	data := map[string]int64{"current": current, "ema": emaMs}
 	raw, _ := json.Marshal(data)
 	return p.rdb.Set(ctx, "system:exchange_ping", raw, 60*time.Second).Err()
+}
+
+// PublishMetrics записывает текущее значение счётчика пропущенных
+// публикаций в Redis. Вызывается из RunPingLoop раз в 10 секунд —
+// тем же ритмом, что и PublishExchangePing, чтобы не создавать лишнюю
+// нагрузку на Redis отдельным циклом.
+//
+// TTL тот же принцип, что у exchange_ping: если бот упал, значение
+// протухнет через минуту, а не будет висеть в Redis как будто бот жив.
+func (p *Publisher) PublishMetrics(ctx context.Context) error {
+	data := map[string]int64{"dropped_publications": p.Metrics.Dropped()}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("PublishMetrics marshal: %w", err)
+	}
+	return p.rdb.Set(ctx, "system:bot_metrics", raw, 60*time.Second).Err()
 }
 
 // PublishBalance — записывает баланс аккаунта в Redis при старте бота.
@@ -130,5 +167,3 @@ func (p *Publisher) PublishBalance(ctx context.Context, total, margin, leverage 
 	}
 	return p.rdb.Set(ctx, "account:balance", raw, 0).Err()
 }
-// PublishExchangePingV2 — временная заглушка, используем обновлённую версию
-// PublishExchangePingV2 — временная заглушка, используем обновлённую версию
