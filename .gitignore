@@ -1,5 +1,6 @@
 # Секреты — никогда не коммитим!
 .env
+.redispwd
 
 # Бинарники Go
 *.exe
@@ -23,3 +24,9 @@ node_modules/
 dist/
 CHECKPOINT_*.md
 *.tar.gz
+
+# Локальная сборка деплоя
+.build/
+
+# Временные архивы
+*.zip
