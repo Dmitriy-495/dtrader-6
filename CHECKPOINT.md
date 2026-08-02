@@ -1,4 +1,4 @@
-# DTrader 6 — Полный чекпоинт системы (2026-07-25)
+# DTrader 6 — Полный чекпоинт системы (2026-08-02)
 
 ## ДЕВИЗ
 
@@ -38,10 +38,10 @@
 
 | ID  | Имя              | Бывшее имя   | Статус                          | Роль                                 |
 | --- | ---------------- | ------------ | ------------------------------- | ------------------------------------ |
-| A   | market-data      | bot          | ✅ Отрефакторен, в бою на 2 VDS | Gate.io → Redis                      |
+| A   | market-data      | bot          | 🔶 Доработка orderbook (см. 13b) | Gate.io → Redis                      |
 | B   | executor         | trader       | ⬜ Планируется                  | Сигналы → Ордера Gate.io             |
 | C   | signal-engine    | strategies   | ⬜ Планируется                  | Индикаторы → Сигналы TVP-Sniper      |
-| D   | analyzer         | indicators   | 🔶 Следующий в разработке       | Поток данных → Индикаторы            |
+| D   | analyzer         | indicators   | ✅ Готов (см. раздел 13a)       | Поток данных → Индикаторы            |
 | E   | risk-guard       | risk-manager | ⬜ Планируется                  | Фильтрация сигналов, защита капитала |
 | F   | ws-server        | ws-server    | ✅ Работает                     | Redis → WebSocket → TUI              |
 | G   | position-tracker | —            | ⬜ Планируется                  | Позиции, P&L реальный                |
@@ -199,9 +199,15 @@ export PATH=$PATH:$(go env GOPATH)/bin
 ## 4. РЕПОЗИТОРИИ
 
 ```
-github.com/Dmitriy-495/dtrader-6      ветка master (bot + ws-server)
+github.com/Dmitriy-495/dtrader-6      ветка master (bot + ws-server + analyzer)
 github.com/Dmitriy-495/dtrader-tui-6  ветка main   (TUI, ПУБЛИЧНЫЙ)
 ```
+
+`analyzer/` — новый сервис в корне репозитория `dtrader-6`, рядом с
+`bot/` и `ws-server/` (свой `go.mod`, `github.com/Dmitriy-495/dtrader-6/analyzer`,
+те же версии зависимостей `go-redis`/`godotenv`/`yaml`, что и в остальных
+сервисах — единообразие сознательное, не дублирование версий без
+причины). Добавлен и запушен 2026-08-02 (см. раздел 13a).
 
 ---
 
@@ -249,6 +255,19 @@ cd ~/code/dtrader/dtrader-6
 SSH-туннели к ws-server (`up`/`down`/`status`) — на случай, если нужен
 доступ в обход публичного порта 9000.
 
+### ⬜ TODO: analyzer пока НЕ в deploy.sh/bootstrap.sh
+
+`analyzer/` написан и проверен только ЛОКАЛЬНО (живой прогон против
+локального Redis, см. раздел 13a) — на VDS (msk/sgp) ещё не
+разворачивался. Когда будем катить: добавить `dtrader-analyzer.service`
+в bootstrap.sh (тот же паттерн Restart=on-failure, что и у bot/ws-server),
+добавить `analyzer` как цель в deploy.sh (`./deploy.sh analyzer`),
+завести `~/dtrader-6/shared/config/analyzer.env` (нужен только
+REDIS_PASSWORD — analyzer не ходит к Gate.io и не имеет других
+секретов). Сознательно отложено — сначала нужно доделать P (раздел
+13b, доработка bot), иначе на проде analyzer будет писать
+indicators:pressure по неверным данным.
+
 ---
 
 ## 6. REDIS СХЕМА
@@ -258,7 +277,7 @@ SSH-туннели к ws-server (`up`/`down`/`status`) — на случай, е
 | Ключ                           | Тип    | TTL | Содержимое                                   |
 | ------------------------------ | ------ | --- | -------------------------------------------- |
 | `market:trades:{symbol}`       | Stream | —   | тики: price, size, ts (лимит из config.yaml) |
-| `market:orderbook:{symbol}`    | String | —   | JSON снапшот стакана                         |
+| `market:orderbook:{symbol}`    | String | —   | ⚠️ СЕЙЧАС: последняя ИНКРЕМЕНТАЛЬНАЯ дельта (b/a — только изменившиеся уровни), не полный стакан. Доработка в работе — см. раздел 13b |
 | `market:candles:1m:{symbol}`   | List   | —   | закрытые свечи (лимит из config.yaml)        |
 | `market:liquidations:{symbol}` | Stream | —   | ликвидации (лимит из config.yaml)            |
 | `market:stats:{symbol}`        | String | —   | JSON: lsr_taker, open_interest_usd           |
@@ -276,12 +295,18 @@ SSH-туннели к ws-server (`up`/`down`/`status`) — на случай, е
 `config.yaml` (`storage.trades`, `storage.candles_1m`,
 `storage.liquidations`), см. раздел 8.
 
+### Ключи analyzer — ГОТОВЫ (см. раздел 13a)
+
+| Ключ                                | TTL | Содержимое                                                        |
+| ------------------------------------ | --- | ------------------------------------------------------------------ |
+| `indicators:trend:{tf}:{symbol}`    | 60s | JSON: {ema_fast, ema_slow, direction, angle, rsi, macd_histogram, ts} — tf ∈ 1m/8m/24m |
+| `indicators:volume:{tf}:{symbol}`   | 60s | JSON: {buy_vol, sell_vol, delta, spike, ts} — tf ∈ 1m/8m/24m       |
+| `indicators:pressure:{symbol}`      | 60s | JSON: {bid_vol, ask_vol, imbalance, ts} — без {tf}, P не привязан к таймфрейму |
+
 ### Планируемые ключи (будущие сервисы)
 
 | Ключ                              | Сервис           | Содержимое         |
 | --------------------------------- | ---------------- | ------------------ |
-| `indicators:ema:{tf}:{symbol}`    | analyzer         | EMA по таймфреймам |
-| `indicators:volume:{tf}:{symbol}` | analyzer         | объёмное давление  |
 | `signals:entry:{symbol}`          | signal-engine    | сигналы входа      |
 | `positions:current`               | position-tracker | открытые позиции   |
 | `positions:pnl`                   | position-tracker | P&L реальный       |
@@ -409,6 +434,21 @@ ws-server/
     ├── reader/redis.go        — чтение Redis, агрегация trades 500ms,
     │                            heartbeat 10s, broadcastSystem
     └── handler/ws.go          — WS handler, аутентификация по API ключу
+```
+
+### analyzer/ — НОВЫЙ сервис, полная структура и детали в разделе 13a
+
+```
+analyzer/
+├── cmd/main.go
+├── config.yaml
+└── internal/
+    ├── config/config.go
+    ├── redisclient/client.go
+    ├── reader/{candles,trades,orderbook}.go
+    ├── indicator/{ema,rsi,macd,trendangle,trend,volume,pressure}.go
+    ├── engine/symbol_engine.go
+    └── publisher/redis.go
 ```
 
 ---
@@ -577,18 +617,155 @@ Redis ключ: system:exchange_ping → {"current": X, "ema": Y}
 - Подключить и протестировать живьём против ws-server на msk/sgp
   (готово со стороны сервера, TUI ещё не тестировался живьём)
 
-### 🔶 Приоритет 4 — analyzer (СЛЕДУЮЩИЙ В РАБОТЕ)
+### ✅ Приоритет 4 — analyzer — ГОТОВ (раздел 13a)
 
-Первый сервис, читающий данные из Redis (`market:trades:*`,
-`market:candles:1m:*`, `market:orderbook:*`) и считающий индикаторы
-для TVP-Sniper:
+### 13a. analyzer — детали реализации
 
-- T (таймфреймы 1m/8m/24m) — тренд на нескольких ТФ
-- V (объёмы) — давление покупок/продаж
-- P (давление стакана) — order book imbalance
+Первый сервис, читающий данные из Redis и считающий индикаторы для
+TVP-Sniper. Полностью написан, собран и проверен живым прогоном
+(config → engine → reader → indicator → publisher → Redis).
 
-Результаты пишет в `indicators:*` (см. раздел 6, планируемые ключи).
-Начинается в отдельном чате с чистым контекстом.
+**Таймфреймы:** 1m (нативный, приходит из bot) / 8m / 24m — 8m и 24m
+analyzer строит САМ через OHLCV rollup из `market:candles:1m`, bot их
+не публикует и не должен (сознательное решение — см. обсуждение ниже).
+
+**Источники и способ чтения:**
+
+| Источник                        | Тип    | Способ чтения                    |
+| -------------------------------- | ------ | --------------------------------- |
+| `market:candles:1m:{symbol}`    | List   | poll (раз в calc_interval)        |
+| `market:trades:{symbol}`        | Stream | XREAD блокирующий (нужен каждый тик и порядок для V) |
+| `market:orderbook:{symbol}`     | String | poll раз в 1s (снапшот состояния) |
+
+**Индикаторы (T/V/P), стартовые параметры — см. `analyzer/config.yaml`:**
+
+- T на 24m: EMA(72)/EMA(50), Trend Angle (линейная регрессия), RSI(14)
+- T на 8m: EMA(24)/EMA(12), MACD(12,26,9)
+- T на 1m: EMA(21)/EMA(9)
+- V: buy/sell объём из потока trades, детект Volume Spike (×2.5 от SMA(20))
+- P: `Buy_Pressure = Σbid_vol(20 уровней) / Σask_vol(20 уровней)`
+
+Все цифры взяты как стартовая точка из документа `TVP_SNIPER.md`
+(роли HTF/MTF из прошлых обсуждений стратегии) — требуют тестирования
+на реальной истории, не финальные боевые значения.
+
+**Важное архитектурное решение:** analyzer публикует ТОЛЬКО сырые
+индикаторы T/V/P по отдельности в `indicators:*` (см. раздел 6).
+Сборку в единый TVP-сигнал (веса, пороги входа) делает `signal-engine`
+— не analyzer. Явно согласованная граница ответственности сервисов.
+
+**Concurrency:** один `Engine` на символ (горутина, независимый цикл),
+внутри — 3 читателя (candles/trades/orderbook, независимые) + 1
+`calcTicker` (раз в `calc_interval`, по умолчанию 5s, считает T/V/P из
+накопленного состояния и публикует). Общее состояние символа защищено
+одним `sync.Mutex`. По аналогии с паттерном `TradeAgg` в
+`ws-server/internal/reader/redis.go`, расширенным на три источника.
+
+**Структура:**
+
+```
+analyzer/
+├── cmd/main.go              — точка входа, graceful shutdown (SIGINT/SIGTERM),
+│                                Engine на каждый символ в своей горутине
+├── config.yaml               — символы, таймфреймы, периоды индикаторов
+└── internal/
+    ├── config/config.go      — Load() + validate(), тот же паттерн, что в bot
+    ├── redisclient/client.go — одно соединение на reader+publisher
+    ├── reader/
+    │   ├── candles.go         — FetchRecent1m, Aggregate (OHLCV rollup 1m→8m/24m)
+    │   ├── trades.go          — XREAD market:trades, тот же паттерн что ws-server
+    │   └── orderbook.go       — poll market:orderbook (см. ⚠️ ниже)
+    ├── indicator/              — ЧИСТАЯ математика, никакого Redis/JSON
+    │   ├── ema.go, rsi.go, macd.go, trendangle.go
+    │   ├── trend.go            — сборка T (EMA+RSI+MACD+Angle) в TrendSnapshot
+    │   ├── volume.go           — V: buy/sell/delta/spike
+    │   └── pressure.go         — P: bid_vol/ask_vol/imbalance
+    ├── engine/symbol_engine.go — Engine на символ, склеивает reader+indicator+publisher
+    └── publisher/redis.go      — PublishTrend/PublishVolume/PublishPressure, TTL 60s
+```
+
+**⚠️ Известное ограничение (см. раздел 13b):** `reader/orderbook.go`
+уже написан под ЦЕЛЕВОЙ формат `market:orderbook:{symbol}` — полный
+снапшот стакана (не дельту). На момент написания analyzer bot всё ещё
+публикует туда последнюю ИНКРЕМЕНТАЛЬНУЮ дельту (см. раздел 6) — P
+будет давать некорректные значения, пока bot не доработан. Как только
+bot начнёт публиковать полный снапшот по тому же ключу и с теми же
+именами полей (`s`/`b`/`a`, `p`/`s` внутри уровня) — никаких изменений
+в analyzer не потребуется.
+
+**Живой прогон, подтверждающий работоспособность (2026-08-02):**
+поднят локальный Redis, залиты тестовые данные точно в форматах bot
+(200 минутных свечей с трендом, 30 живых trades через XADD во время
+работы analyzer, полный снапшот orderbook на 20 уровней), собран и
+запущен реальный бинарник. Результат в `indicators:*`:
+- T на 8m/24m корректно определил `direction: "up"` (данные были с
+  восходящим трендом)
+- P посчитал `imbalance: 1.51` (bids были специально сделаны жирнее)
+- V корректно накопил `buy_vol`/`sell_vol` из живого потока (не из
+  истории — `TradeReader` намеренно слушает только НОВЫЕ записи через
+  `XREAD ... "$"`, так же как `ws-server`)
+- Graceful shutdown по сигналу — чисто, без паник
+
+`go build ./...` и `go vet ./...` — чисто, без единого замечания.
+
+**Не сделано намеренно (отложено):**
+- Ликвидации (`market:liquidations`) — не нужны для v1 TVP-Sniper
+  (формула T+V+P их не использует), возможный кандидат для будущей
+  версии либо сразу для risk-guard (каскады ликвидаций как триггер
+  аварийного стопа)
+- Поглощение крупных ордеров в P (требует истории стакана во времени,
+  не только снапшота) — отложено на следующую итерацию после v1
+- LLM-модуль "Стратег" (Deep Seek для доп. тех.анализа, Grok для
+  новостного фона) — обсуждалась идея отдельно, осознанно отложена до
+  стабилизации базового T/V/P-ядра
+
+### 🔶 Приоритет 4.5 — доработка bot: orderbook snapshot (раздел 13b, В РАБОТЕ)
+
+### 13b. bot — доработка: полный снапшот стакана вместо дельты
+
+**Проблема:** `market:orderbook:{symbol}` сейчас содержит последнюю
+ИНКРЕМЕНТАЛЬНУЮ дельту стакана (`order_book_update` от Gate.io — это
+incremental channel по протоколу биржи), а не полный, поддерживаемый
+стакан. Обнаружено при проектировании P-индикатора в analyzer — для
+`Buy_Pressure = Σbid_vol/Σask_vol` нужен актуальный полный стакан на
+N уровней, не последний присланный кусок изменений.
+
+**Согласованное архитектурное решение:** поддержание полного стакана
+(REST-снапшот как база + применение входящих дельт + отслеживание
+разрывов последовательности `U`/`u`) — это STATEFUL-логика ПРОТОКОЛА
+БИРЖИ, а не логика анализа рынка. Место для неё — `bot`, рядом с
+WS-клиентом Gate.io, а НЕ analyzer, по тем же причинам, по которым
+`bot` уже владеет единственной точкой интеграции с биржей:
+
+- analyzer не должен обзаводиться собственным REST-клиентом к Gate.io
+  просто ради одного вызова снапшота при старте/ресинке
+- отслеживание разрывов `U`/`u` требует явного управления самим WS-
+  соединением (переподписка при разрыве) — это зона `wsClient.Connect`,
+  которым управляет bot, не analyzer
+- `market:*` в Redis должен быть самодостаточным для ЛЮБОГО будущего
+  потребителя (не только analyzer) — если стакан "доделывает" один
+  consumer, второй future-consumer вынужден писать ту же логику заново
+
+**Что нужно сделать в bot:**
+
+1. Добавить REST-метод получения снапшота стакана (глубина 20 уровней
+   — совпадает с текущим `orderbook.depth` в `config.yaml`, глубже не
+   нужно — P работает с топом стакана, не с полной ликвидностью)
+2. При `Connect`/переподписке — сначала брать REST-снапшот, потом
+   начинать применять входящие WS-дельты поверх него
+3. Держать в памяти актуальный стакан на символ (map по symbol),
+   применять входящие дельты по `U`/`u` id обновлений
+4. При обнаружении разрыва последовательности — пересинхронизация:
+   заново REST-снапшот + переподписка на дельты для этого символа
+5. `publisher.PublishOrderBook` публикует уже ПОЛНЫЙ стакан (после
+   применения дельты), тем же ключом `market:orderbook:{symbol}` и
+   тем же форматом полей (`s`/`b`/`a`, `p`/`s` внутри уровня) — analyzer
+   уже готов к этому формату, изменений в analyzer НЕ потребуется
+
+**Статус: начинается в отдельном, специализированном чате** (см.
+приоритет 4.5 выше) — задача самодостаточна, не требует контекста
+проектирования analyzer, но требует свежего погружения в
+`bot/internal/gateway/` (parser.go, connection.go, rest.go, ws.go).
 
 ### Приоритет 5 — остальные новые сервисы
 

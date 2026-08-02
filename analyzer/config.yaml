@@ -1,0 +1,84 @@
+# =============================================================================
+# DTrader 6 — Analyzer Service Configuration
+# Analyzer читает сырые рыночные данные из Redis (пишет их bot) и считает
+# индикаторы T (тренд) / V (объём) / P (давление стакана) для TVP-Sniper.
+# Analyzer НИКОГДА не ходит к Gate.io напрямую — единственный источник
+# данных для него — Redis, единственный секрет — REDIS_PASSWORD.
+# =============================================================================
+
+app:
+  name: dtrader-6-analyzer
+  env: development         # development | production
+
+# Торгуемые пары — должны совпадать с symbols в bot/config.yaml,
+# иначе analyzer будет читать ключи market:*, которые никто не пишет.
+symbols:
+  - BTC_USDT
+  - ETH_USDT
+  - SOL_USDT
+
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+
+# Таймфреймы TVP-Sniper. Base — нативный ТФ из bot (market:candles:1m:*).
+# Aggregates — таймфреймы, которые analyzer строит САМ из Base путём
+# OHLCV-ролапа (см. internal/reader/candles.go) — bot их не публикует.
+timeframes:
+  base: 1m
+  aggregates:
+    - 8m
+    - 24m
+
+# Периоды индикаторов тренда (T) — стартовые значения из документа
+# TVP_SNIPER.md (роли Главнокомандующий=24m, Генерал=8m), взяты как
+# точка отсчёта для последующего тестирования, НЕ как окончательные
+# боевые цифры (см. диапазоны тестирования в самом документе).
+indicators:
+  trend:
+    "1m":
+      ema_fast: 9
+      ema_slow: 21
+      rsi_period: 14
+      angle_periods: 20
+      # MACD на 1m не считаем (0 = выключен, см. TrendParams в config.go)
+      macd_fast: 0
+      macd_slow: 0
+      macd_signal: 0
+    "8m":
+      ema_fast: 12
+      ema_slow: 24
+      rsi_period: 14
+      angle_periods: 20
+      macd_fast: 12
+      macd_slow: 26
+      macd_signal: 9
+    "24m":
+      ema_fast: 50
+      ema_slow: 72
+      rsi_period: 14
+      angle_periods: 20
+      # MACD на 24m не используется в TVP_SNIPER доке (был только на MTF/8m)
+      macd_fast: 0
+      macd_slow: 0
+      macd_signal: 0
+
+  # Объёмное давление (V) — общее для всех ТФ на первом этапе.
+  volume:
+    spike_multiplier: 2.5   # объём > SMA(20) * 2.5 = всплеск объёма
+    sma_period: 20
+
+  # Давление стакана (P) — Buy_Pressure = Σbid_vol(depth) / Σask_vol(depth).
+  # ВАЖНО: сейчас market:orderbook:{symbol} содержит инкрементальную дельту,
+  # а не полный стакан (bot пока не поддерживает снапшот — доработка bot
+  # ведётся параллельно). До завершения этой доработки pressure.go будет
+  # получать неполные данные и это ожидаемо — см. CHECKPOINT.md.
+  pressure:
+    depth: 20                # совпадает с orderbook.depth в bot/config.yaml
+
+# Как часто пересчитывать индикаторы из накопленного в памяти состояния
+# (буферы свечей/trades/orderbook). TVP-Sniper не требует миллисекундной
+# гонки кроме самого момента входа (это уже LTF/P, обновляется отдельно
+# при каждом poll orderbook) — раз в 5 секунд достаточно для T и V.
+calc_interval: 5s
