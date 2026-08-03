@@ -98,7 +98,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	wsClient := gateway.NewWSClient(cfg.Exchange.WsURL, cfg.Secrets.APIKey, cfg.Secrets.APISecret, pub)
+	wsClient := gateway.NewWSClient(cfg.Exchange.WsURL, cfg.Secrets.APIKey, cfg.Secrets.APISecret, pub, client)
 
 	// reconnectInterval — пауза перед повторной попыткой подключения,
 	// берётся из config.yaml (exchange.reconnect_interval), а не
@@ -108,6 +108,18 @@ func main() {
 	subscribeAll := func() error {
 		if err := wsClient.SubscribeTrades(cfg.Symbols); err != nil {
 			return fmt.Errorf("trades: %w", err)
+		}
+		// InitOrderBookSnapshots — ДО подписки на order_book_update.
+		// Официальный алгоритм Gate.io требует базовый REST-снапшот перед
+		// тем, как доверять входящим WS-дельтам (см. orderbook.go). Делаем
+		// это при КАЖДОМ вызове subscribeAll, то есть при каждом реконнекте
+		// тоже — старое состояние LocalOrderBook из прошлого соединения не
+		// годится для нового потока дельт (свои U/u id, своя нумерация).
+		snapCtx, cancelSnap := context.WithTimeout(context.Background(), gateway.RequestTimeout)
+		err := wsClient.InitOrderBookSnapshots(snapCtx, cfg.Symbols, cfg.Orderbook.Depth)
+		cancelSnap()
+		if err != nil {
+			return fmt.Errorf("orderbook snapshots: %w", err)
 		}
 		if err := wsClient.SubscribeOrderBookUpdate(cfg.Symbols, cfg.Orderbook.Depth); err != nil {
 			return fmt.Errorf("order_book_update: %w", err)

@@ -65,17 +65,27 @@ type OBLevel struct {
 	Size  string `json:"s"`
 }
 
-// OrderBookUpdate — инкрементальное обновление стакана (канал futures.order_book_update).
-// Инкрементальное значит: это не весь стакан целиком, а только то, что
-// изменилось с последнего обновления.
+// OrderBookUpdate — обновление стакана с канала futures.order_book_update.
+// Full=true означает, что это ПОЛНЫЙ снапшот на текущий момент (биржа
+// иногда шлёт полные пересылки, не только инкрементальные дельты) —
+// в этом случае нужно ЗАМЕНИТЬ локальный стакан целиком, а не применять
+// как дельту поверх существующего состояния. Full=false (обычный случай)
+// значит "вот что изменилось с прошлого раза" — применяем поверх.
 type OrderBookUpdate struct {
-	T      int64     `json:"t"` // timestamp обновления (ms)
-	S      string    `json:"s"` // symbol, например "BTC_USDT"
-	U      int64     `json:"u"` // ID этого обновления
-	FirstU int64     `json:"U"` // ID первого обновления в пакете
-	Bids   []OBLevel `json:"b"` // покупки (bid)
-	Asks   []OBLevel `json:"a"` // продажи (ask)
+	T      int64     `json:"t"`    // timestamp обновления (ms)
+	Full   bool      `json:"full"` // true = полный снапшот, false/omitted = инкрементальная дельта
+	S      string    `json:"s"`    // symbol, например "BTC_USDT"
+	U      int64     `json:"u"`    // ID последнего обновления в этом пакете (last update ID)
+	FirstU int64     `json:"U"`    // ID первого обновления в этом пакете (first update ID)
+	Bids   []OBLevel `json:"b"`    // покупки (bid)
+	Asks   []OBLevel `json:"a"`    // продажи (ask)
 }
+
+// OrderBookSnapshot — см. определение и комментарии в rest.go, рядом с
+// методом GetOrderBookSnapshot, который его и возвращает. Здесь не
+// дублируем — REST-специфичные типы (ответы конкретных эндпоинтов)
+// естественнее держать рядом с методом, который их разбирает, а не
+// среди WS-структур протокола (см. общий принцип этого файла в шапке).
 
 // Candle — одна свеча (канал futures.candlesticks).
 // Window=true означает "эта свеча уже ЗАКРЫЛАСЬ" — только такие

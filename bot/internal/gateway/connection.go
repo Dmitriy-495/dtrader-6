@@ -33,17 +33,42 @@ type WSClient struct {
 
 	pingTs int64   // timestamp последнего отправленного ping (unix ms) — используется в pingloop.go
 	emaLat float64 // EMA латентности (ms) — используется в pingloop.go
+
+	// restClient — REST-клиент Gate.io, нужен ТОЛЬКО для одной вещи:
+	// получить снапшот стакана (GetOrderBookSnapshot) при инициализации
+	// и при пересинхронизации (см. orderbook.go). WSClient и Client (REST)
+	// остаются независимыми типами — здесь просто переиспользуется уже
+	// существующий REST-клиент, тот же самый, что main.go использует для
+	// Ping/GetUnifiedBalance/GetPositions, а не создаётся второй.
+	restClient *Client
+
+	// books — локально поддерживаемый полный стакан на каждый символ
+	// (см. LocalOrderBook в orderbook.go). booksMu защищает map от
+	// одновременного доступа: ReadLoop пишет на каждую входящую дельту,
+	// а resyncOrderBook может писать асинхронно из отдельной горутины
+	// при обнаружении разрыва последовательности.
+	books   map[string]*LocalOrderBook
+	booksMu sync.Mutex
 }
 
 // NewWSClient создаёт новый WS-клиент. Соединение ещё не устанавливается —
 // для этого нужно отдельно вызвать Connect.
-func NewWSClient(url, apiKey, secret string, pub *publisher.Publisher) *WSClient {
+//
+// restClient — REST-клиент Gate.io для получения снапшотов стакана.
+// Может быть nil, если orderbook snapshot/resync не нужен (например,
+// в будущих unit-тестах, которые проверяют только trades/candles) —
+// InitOrderBookSnapshots и resyncOrderBook в этом случае просто не
+// сработают (см. проверку c.restClient == nil в orderbook.go), а не
+// упадут с паникой.
+func NewWSClient(url, apiKey, secret string, pub *publisher.Publisher, restClient *Client) *WSClient {
 	return &WSClient{
-		url:    url,
-		apiKey: apiKey,
-		secret: secret,
-		pub:    pub,
-		done:   make(chan struct{}, 1),
+		url:        url,
+		apiKey:     apiKey,
+		secret:     secret,
+		pub:        pub,
+		done:       make(chan struct{}, 1),
+		restClient: restClient,
+		books:      make(map[string]*LocalOrderBook),
 	}
 }
 
@@ -95,7 +120,16 @@ func (c *WSClient) Connect(ctx context.Context) error {
 		// больших объёмах из-за особенностей JSON-парсинга чисел.
 		"X-Gate-Size-Decimal": []string{"1"},
 	}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.url, header)
+	// Используем явный Dialer с Proxy: nil вместо websocket.DefaultDialer.
+	// DefaultDialer по умолчанию тоже читает переменные окружения
+	// HTTP_PROXY/HTTPS_PROXY (как и http.Client в client.go) — если
+	// в окружении случайно остался мусор от старой настройки прокси,
+	// WS-подключение к бирже точно так же встанет колом. Бот должен
+	// всегда ходить к Gate.io напрямую, вне зависимости от окружения.
+	dialer := &websocket.Dialer{
+		Proxy: nil,
+	}
+	conn, _, err := dialer.DialContext(ctx, c.url, header)
 	if err != nil {
 		return fmt.Errorf("WS коннект не удался: %w", err)
 	}

@@ -56,17 +56,71 @@ func (c *WSClient) handleTrades(ctx context.Context, raw json.RawMessage) {
 	}
 }
 
-// handleOrderBook обрабатывает инкрементальное обновление стакана
-// с канала futures.order_book_update. В отличие от trades/candles,
-// здесь один объект на сообщение, а не массив — публикуем как есть.
+// handleOrderBook обрабатывает входящее сообщение с канала
+// futures.order_book_update — это может быть либо ПОЛНЫЙ снапшот
+// (Full == true, редкий случай — см. protocol.go и обработку в
+// orderbook.go/ApplyDelta), либо, в подавляющем большинстве случаев,
+// ИНКРЕМЕНТАЛЬНАЯ дельта. Разница обрабатывается внутри
+// LocalOrderBook.ApplyDelta — здесь эта деталь не важна, просто
+// передаём сообщение как есть.
+//
+// В отличие от предыдущей версии (которая публиковала сырую дельту
+// как есть — см. CHECKPOINT.md, раздел 13b), эта версия:
+//  1. применяет дельту к локально поддерживаемому полному стакану
+//     (см. orderbook.go, LocalOrderBook.ApplyDelta)
+//  2. публикует в Redis уже ПОЛНЫЙ стакан после применения — analyzer
+//     спроектирован читать из market:orderbook:{symbol} именно полный
+//     снапшот, не дельту (см. CHECKPOINT.md, раздел 13a)
+//  3. при обнаружении разрыва последовательности запускает
+//     пересинхронизацию в отдельной горутине — не блокирует ReadLoop
+//     на время REST-запроса
 func (c *WSClient) handleOrderBook(ctx context.Context, raw json.RawMessage) {
 	var ob OrderBookUpdate
 	if err := json.Unmarshal(raw, &ob); err != nil {
 		log.Printf("⚠️ order_book_update parse error: %v", err)
 		return
 	}
+
+	c.booksMu.Lock()
+	lob, exists := c.books[ob.S]
+	c.booksMu.Unlock()
+
+	if !exists {
+		// Дельта пришла раньше, чем успел отработать InitOrderBookSnapshots
+		// (см. main.go — снапшоты запрашиваются ДО подписки на канал,
+		// но сетевые вызовы не мгновенны). Это ожидаемая гонка на старте,
+		// не ошибка — просто пропускаем дельту и ждём следующую, снапшот
+		// появится очень скоро.
+		return
+	}
+
+	applied, needResync := lob.ApplyDelta(ob)
+
+	if needResync {
+		log.Printf("🔄 [orderbook] обнаружен разрыв последовательности: %s — пересинхронизация", ob.S)
+		// depth берём из фактической глубины уже загруженного снапшота —
+		// столько уровней запросили изначально, столько и запрашиваем
+		// заново, глубина не должна "плавать" между вызовами (см.
+		// предупреждение в официальной документации Gate.io о
+		// необходимости совпадения depth снапшота и level подписки).
+		depth := len(ob.Bids)
+		if depth == 0 {
+			depth = len(ob.Asks)
+		}
+		go c.resyncOrderBook(ob.S, depth)
+		return
+	}
+
+	if !applied {
+		// Ждём точку стыковки со свежим снапшотом — см. комментарий
+		// в LocalOrderBook.ApplyDelta, это ожидаемо в первые мгновения
+		// после инициализации, не ошибка.
+		return
+	}
+
 	if c.pub != nil {
-		if err := c.pub.PublishOrderBook(ctx, ob.S, ob); err != nil {
+		snapshot := lob.Snapshot(ob.T)
+		if err := c.pub.PublishOrderBook(ctx, ob.S, snapshot); err != nil {
 			log.Printf("⚠️ publish order_book failed: symbol=%s err=%v", ob.S, err)
 			c.pub.Metrics.IncDropped()
 		}
