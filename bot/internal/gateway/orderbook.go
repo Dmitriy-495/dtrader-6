@@ -71,10 +71,14 @@ func newLocalOrderBook(symbol string, snap *OrderBookSnapshot) *LocalOrderBook {
 		synced:       false,
 	}
 	for _, lvl := range snap.Bids {
-		lob.setLevel(lob.bids, lvl.Price, lvl.Size)
+		// lvl.Size — json.Number (REST-формат, см. OBLevelREST в rest.go).
+		// .String() отдаёт исходное текстовое представление без потери
+		// форматирования — дальше setLevel хранит это же значение как
+		// sizeStr, которое публикуется в Redis как есть.
+		lob.setLevel(lob.bids, lvl.Price, lvl.Size.String())
 	}
 	for _, lvl := range snap.Asks {
-		lob.setLevel(lob.asks, lvl.Price, lvl.Size)
+		lob.setLevel(lob.asks, lvl.Price, lvl.Size.String())
 	}
 	return lob
 }

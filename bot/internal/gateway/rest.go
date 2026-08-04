@@ -3,6 +3,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 )
 
@@ -84,6 +85,62 @@ type Position struct {
 	Mode             string `json:"mode"`
 }
 
+// OBLevelREST — один уровень стакана В ФОРМАТЕ REST-ОТВЕТА Gate.io.
+//
+// ⚠️ ВАЖНОЕ ОТЛИЧИЕ ОТ WS: в протоколе futures.order_book_update (WS)
+// поле size приходит как JSON-СТРОКА (см. OBLevel в protocol.go, "p"/"s"
+// оба string). А вот в REST-ответе GET /futures/usdt/order_book Gate.io
+// шлёт size как JSON-ЧИСЛО, не строку — это подтверждено на практике
+// (реальный ответ биржи на pre-prod сервере msk дал ошибку
+// "cannot unmarshal number into Go struct field OBLevel.asks.s of type
+// string", когда мы по ошибке предположили, что формат одинаков для
+// WS и REST). Отсюда — два разных типа, не один общий OBLevel.
+//
+// Price остаётся строкой в обоих случаях (это подтверждено, ошибка была
+// именно и только на size) — JSON-число с плавающей точкой, отформатированное
+// как обычная цена ("100.5"), Go спокойно разбирает и как число, и как
+// строку, поэтому расхождение проявилось только на size, не на price.
+//
+// json.Number (не float64 напрямую) выбран по той же причине, что и в
+// ContractStats (см. protocol.go): даёт доступ к точному числу через
+// .Float64()/.String(), но не привязывается жёстко к одному JSON-представлению —
+// если Gate.io когда-нибудь в одном ответе смешает число и строку для
+// разных уровней (наблюдалось для других полей API Gate.io), json.Number
+// разберёт оба варианта без паники, а float64 упал бы на JSON-строке.
+type OBLevelREST struct {
+	Price string      `json:"p"`
+	Size  json.Number `json:"s"`
+}
+
+// OrderBookSnapshot — структура ответа GET /futures/usdt/order_book?with_id=true.
+// Поля списаны с реального ответа биржи (см. комментарий у OBLevelREST про
+// расхождение типов между WS и REST) — НЕ идентичны официальному Go SDK
+// gateapi-go/model_futures_order_book.go в части Asks/Bids: тот SDK
+// использует []FuturesOrderBookItem, но точный тип этого элемента не
+// удалось подтвердить из документации, а прямая проверка на боевом
+// сервере (msk) однозначно показала json-число для size — доверяем
+// фактическому поведению API, а не предположению по аналогии с WS.
+//
+// Именно с этого снапшота начинается локальный стакан (см. orderbook.go):
+// REST даёт "точку опоры" с конкретным ID, дальше WS-дельты (order_book_update)
+// применяются поверх неё. Без снапшота дельты применять не к чему — дельта
+// говорит только "что изменилось", а не "что было".
+type OrderBookSnapshot struct {
+	// ID — идентификатор состояния стакана на момент снапшота.
+	// Он же (со сдвигом +1) должен совпасть с полем U одной из входящих
+	// WS-дельт — это и есть "точка стыковки" снапшота с потоком дельт.
+	// Присутствует в ответе, только если запрос сделан с with_id=true.
+	ID int64 `json:"id"`
+	// Current — момент генерации ответа (unix seconds, по документации Gate.io).
+	Current float64 `json:"current"`
+	// Update — момент последнего изменения стакана на момент снапшота.
+	Update float64 `json:"update"`
+	// Asks/Bids — уровни В ФОРМАТЕ REST (OBLevelREST, не OBLevel!) —
+	// см. комментарий у OBLevelREST, почему это разные типы.
+	Asks []OBLevelREST `json:"asks"`
+	Bids []OBLevelREST `json:"bids"`
+}
+
 // =============================================================================
 // МЕТОДЫ REST API
 // =============================================================================
@@ -135,4 +192,24 @@ func (c *Client) GetPositions(ctx context.Context) ([]Position, error) {
 	}
 
 	return active, nil
+}
+
+// GetOrderBookSnapshot возвращает полный снапшот стакана на N уровней —
+// "базу", от которой дальше применяются инкрементальные WS-дельты
+// (см. orderbook.go). Публичный endpoint — авторизация не нужна.
+//
+// Endpoint: GET /futures/usdt/order_book?contract={symbol}&limit={depth}&with_id=true
+// with_id=true обязателен — без него ответ не будет содержать поле id,
+// а без id нельзя состыковать снапшот с потоком WS-дельт (см. официальный
+// алгоритм ресинхронизации Gate.io: U <= id+1 <= u).
+func (c *Client) GetOrderBookSnapshot(ctx context.Context, symbol string, depth int) (*OrderBookSnapshot, error) {
+	var snapshot OrderBookSnapshot
+
+	query := fmt.Sprintf("contract=%s&limit=%d&with_id=true", symbol, depth)
+	err := c.GetPublic(ctx, "/futures/usdt/order_book", query, &snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка получения снапшота стакана %s: %w", symbol, err)
+	}
+
+	return &snapshot, nil
 }
