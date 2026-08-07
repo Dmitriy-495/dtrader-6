@@ -1,4 +1,4 @@
-# DTrader 6 — Полный чекпоинт системы (2026-08-02)
+# DTrader 6 — Полный чекпоинт системы (2026-08-07)
 
 ## ДЕВИЗ
 
@@ -36,16 +36,16 @@
 
 ### Таблица сервисов
 
-| ID  | Имя              | Бывшее имя   | Статус                          | Роль                                 |
-| --- | ---------------- | ------------ | ------------------------------- | ------------------------------------ |
-| A   | market-data      | bot          | 🔶 Доработка orderbook (см. 13b) | Gate.io → Redis                      |
-| B   | executor         | trader       | ⬜ Планируется                  | Сигналы → Ордера Gate.io             |
-| C   | signal-engine    | strategies   | ⬜ Планируется                  | Индикаторы → Сигналы TVP-Sniper      |
-| D   | analyzer         | indicators   | ✅ Готов (см. раздел 13a)       | Поток данных → Индикаторы            |
-| E   | risk-guard       | risk-manager | ⬜ Планируется                  | Фильтрация сигналов, защита капитала |
-| F   | ws-server        | ws-server    | ✅ Работает                     | Redis → WebSocket → TUI              |
-| G   | position-tracker | —            | ⬜ Планируется                  | Позиции, P&L реальный                |
-| Z   | Redis            | Redis        | ✅ Работает (на каждом VDS)     | Шина данных                          |
+| ID  | Имя              | Бывшее имя   | Статус                                  | Роль                                 |
+| --- | ---------------- | ------------ | --------------------------------------- | ------------------------------------ |
+| A   | market-data      | bot          | ✅ Готов (orderbook snapshot — см. 13b) | Gate.io → Redis                      |
+| B   | executor         | trader       | ⬜ Планируется                          | Сигналы → Ордера Gate.io             |
+| C   | signal-engine    | strategies   | ⬜ Планируется                          | Индикаторы → Сигналы TVP-Sniper      |
+| D   | analyzer         | indicators   | ✅ Готов (см. раздел 13a)               | Поток данных → Индикаторы            |
+| E   | risk-guard       | risk-manager | ⬜ Планируется                          | Фильтрация сигналов, защита капитала |
+| F   | ws-server        | ws-server    | ✅ Работает                             | Redis → WebSocket → TUI              |
+| G   | position-tracker | —            | ⬜ Планируется                          | Позиции, P&L реальный                |
+| Z   | Redis            | Redis        | ✅ Работает (на каждом VDS)             | Шина данных                          |
 
 ---
 
@@ -264,9 +264,9 @@ SSH-туннели к ws-server (`up`/`down`/`status`) — на случай, е
 добавить `analyzer` как цель в deploy.sh (`./deploy.sh analyzer`),
 завести `~/dtrader-6/shared/config/analyzer.env` (нужен только
 REDIS_PASSWORD — analyzer не ходит к Gate.io и не имеет других
-секретов). Сознательно отложено — сначала нужно доделать P (раздел
-13b, доработка bot), иначе на проде analyzer будет писать
-indicators:pressure по неверным данным.
+секретов). Блокер снят (раздел 13b, доработка bot orderbook snapshot,
+закрыт 2026-08-07) — можно катить bot+analyzer вместе на msk, живым
+прогоном подтвердить P на реальном стакане Gate.io, затем на sgp.
 
 ---
 
@@ -274,16 +274,16 @@ indicators:pressure по неверным данным.
 
 ### Текущие ключи
 
-| Ключ                           | Тип    | TTL | Содержимое                                   |
-| ------------------------------ | ------ | --- | -------------------------------------------- |
-| `market:trades:{symbol}`       | Stream | —   | тики: price, size, ts (лимит из config.yaml) |
-| `market:orderbook:{symbol}`    | String | —   | ⚠️ СЕЙЧАС: последняя ИНКРЕМЕНТАЛЬНАЯ дельта (b/a — только изменившиеся уровни), не полный стакан. Доработка в работе — см. раздел 13b |
-| `market:candles:1m:{symbol}`   | List   | —   | закрытые свечи (лимит из config.yaml)        |
-| `market:liquidations:{symbol}` | Stream | —   | ликвидации (лимит из config.yaml)            |
-| `market:stats:{symbol}`        | String | —   | JSON: lsr_taker, open_interest_usd           |
-| `system:exchange_ping`         | String | 60s | JSON: {"current":X,"ema":Y} RTT биржи        |
-| `system:bot_metrics`           | String | 60s | JSON: {"dropped_publications":N} — **новое** |
-| `account:balance`              | String | —   | JSON: {"total","margin","leverage"}          |
+| Ключ                           | Тип    | TTL | Содержимое                                                                                                  |
+| ------------------------------ | ------ | --- | ----------------------------------------------------------------------------------------------------------- |
+| `market:trades:{symbol}`       | Stream | —   | тики: price, size, ts (лимит из config.yaml)                                                                |
+| `market:orderbook:{symbol}`    | String | —   | ✅ Полный, поддерживаемый стакан (b/a — все уровни на глубину `orderbook.depth`), не дельта. См. раздел 13b |
+| `market:candles:1m:{symbol}`   | List   | —   | закрытые свечи (лимит из config.yaml)                                                                       |
+| `market:liquidations:{symbol}` | Stream | —   | ликвидации (лимит из config.yaml)                                                                           |
+| `market:stats:{symbol}`        | String | —   | JSON: lsr_taker, open_interest_usd                                                                          |
+| `system:exchange_ping`         | String | 60s | JSON: {"current":X,"ema":Y} RTT биржи                                                                       |
+| `system:bot_metrics`           | String | 60s | JSON: {"dropped_publications":N} — **новое**                                                                |
+| `account:balance`              | String | —   | JSON: {"total","margin","leverage"}                                                                         |
 
 **`system:bot_metrics`** — новый ключ, добавлен при рефакторинге bot.
 Счётчик неудачных попыток публикации в Redis (`Publisher.Metrics`,
@@ -297,19 +297,19 @@ indicators:pressure по неверным данным.
 
 ### Ключи analyzer — ГОТОВЫ (см. раздел 13a)
 
-| Ключ                                | TTL | Содержимое                                                        |
-| ------------------------------------ | --- | ------------------------------------------------------------------ |
-| `indicators:trend:{tf}:{symbol}`    | 60s | JSON: {ema_fast, ema_slow, direction, angle, rsi, macd_histogram, ts} — tf ∈ 1m/8m/24m |
-| `indicators:volume:{tf}:{symbol}`   | 60s | JSON: {buy_vol, sell_vol, delta, spike, ts} — tf ∈ 1m/8m/24m       |
-| `indicators:pressure:{symbol}`      | 60s | JSON: {bid_vol, ask_vol, imbalance, ts} — без {tf}, P не привязан к таймфрейму |
+| Ключ                              | TTL | Содержимое                                                                             |
+| --------------------------------- | --- | -------------------------------------------------------------------------------------- |
+| `indicators:trend:{tf}:{symbol}`  | 60s | JSON: {ema_fast, ema_slow, direction, angle, rsi, macd_histogram, ts} — tf ∈ 1m/8m/24m |
+| `indicators:volume:{tf}:{symbol}` | 60s | JSON: {buy_vol, sell_vol, delta, spike, ts} — tf ∈ 1m/8m/24m                           |
+| `indicators:pressure:{symbol}`    | 60s | JSON: {bid_vol, ask_vol, imbalance, ts} — без {tf}, P не привязан к таймфрейму         |
 
 ### Планируемые ключи (будущие сервисы)
 
-| Ключ                              | Сервис           | Содержимое         |
-| --------------------------------- | ---------------- | ------------------ |
-| `signals:entry:{symbol}`          | signal-engine    | сигналы входа      |
-| `positions:current`               | position-tracker | открытые позиции   |
-| `positions:pnl`                   | position-tracker | P&L реальный       |
+| Ключ                     | Сервис           | Содержимое       |
+| ------------------------ | ---------------- | ---------------- |
+| `signals:entry:{symbol}` | signal-engine    | сигналы входа    |
+| `positions:current`      | position-tracker | открытые позиции |
+| `positions:pnl`          | position-tracker | P&L реальный     |
 
 ---
 
@@ -631,11 +631,11 @@ analyzer строит САМ через OHLCV rollup из `market:candles:1m`, b
 
 **Источники и способ чтения:**
 
-| Источник                        | Тип    | Способ чтения                    |
-| -------------------------------- | ------ | --------------------------------- |
-| `market:candles:1m:{symbol}`    | List   | poll (раз в calc_interval)        |
-| `market:trades:{symbol}`        | Stream | XREAD блокирующий (нужен каждый тик и порядок для V) |
-| `market:orderbook:{symbol}`     | String | poll раз в 1s (снапшот состояния) |
+| Источник                     | Тип    | Способ чтения                                        |
+| ---------------------------- | ------ | ---------------------------------------------------- |
+| `market:candles:1m:{symbol}` | List   | poll (раз в calc_interval)                           |
+| `market:trades:{symbol}`     | Stream | XREAD блокирующий (нужен каждый тик и порядок для V) |
+| `market:orderbook:{symbol}`  | String | poll раз в 1s (снапшот состояния)                    |
 
 **Индикаторы (T/V/P), стартовые параметры — см. `analyzer/config.yaml`:**
 
@@ -674,7 +674,7 @@ analyzer/
     ├── reader/
     │   ├── candles.go         — FetchRecent1m, Aggregate (OHLCV rollup 1m→8m/24m)
     │   ├── trades.go          — XREAD market:trades, тот же паттерн что ws-server
-    │   └── orderbook.go       — poll market:orderbook (см. ⚠️ ниже)
+    │   └── orderbook.go       — poll market:orderbook (полный снапшот, см. раздел 13b)
     ├── indicator/              — ЧИСТАЯ математика, никакого Redis/JSON
     │   ├── ema.go, rsi.go, macd.go, trendangle.go
     │   ├── trend.go            — сборка T (EMA+RSI+MACD+Angle) в TrendSnapshot
@@ -684,20 +684,19 @@ analyzer/
     └── publisher/redis.go      — PublishTrend/PublishVolume/PublishPressure, TTL 60s
 ```
 
-**⚠️ Известное ограничение (см. раздел 13b):** `reader/orderbook.go`
-уже написан под ЦЕЛЕВОЙ формат `market:orderbook:{symbol}` — полный
-снапшот стакана (не дельту). На момент написания analyzer bot всё ещё
-публикует туда последнюю ИНКРЕМЕНТАЛЬНУЮ дельту (см. раздел 6) — P
-будет давать некорректные значения, пока bot не доработан. Как только
-bot начнёт публиковать полный снапшот по тому же ключу и с теми же
-именами полей (`s`/`b`/`a`, `p`/`s` внутри уровня) — никаких изменений
-в analyzer не потребуется.
+**✅ Ограничение снято (см. раздел 13b, закрыт 2026-08-07):** `reader/orderbook.go`
+был написан под ЦЕЛЕВОЙ формат `market:orderbook:{symbol}` — полный
+снапшот стакана (не дельту) — заранее. bot теперь публикует именно
+такой полный снапшот по тому же ключу и с теми же именами полей
+(`s`/`b`/`a`, `p`/`s` внутри уровня) — как и предполагалось, изменений
+в analyzer НЕ потребовалось. P можно доверять на живых данных.
 
 **Живой прогон, подтверждающий работоспособность (2026-08-02):**
 поднят локальный Redis, залиты тестовые данные точно в форматах bot
 (200 минутных свечей с трендом, 30 живых trades через XADD во время
 работы analyzer, полный снапшот orderbook на 20 уровней), собран и
 запущен реальный бинарник. Результат в `indicators:*`:
+
 - T на 8m/24m корректно определил `direction: "up"` (данные были с
   восходящим трендом)
 - P посчитал `imbalance: 1.51` (bids были специально сделаны жирнее)
@@ -709,6 +708,7 @@ bot начнёт публиковать полный снапшот по том�
 `go build ./...` и `go vet ./...` — чисто, без единого замечания.
 
 **Не сделано намеренно (отложено):**
+
 - Ликвидации (`market:liquidations`) — не нужны для v1 TVP-Sniper
   (формула T+V+P их не использует), возможный кандидат для будущей
   версии либо сразу для risk-guard (каскады ликвидаций как триггер
@@ -719,11 +719,14 @@ bot начнёт публиковать полный снапшот по том�
   новостного фона) — обсуждалась идея отдельно, осознанно отложена до
   стабилизации базового T/V/P-ядра
 
-### 🔶 Приоритет 4.5 — доработка bot: orderbook snapshot (раздел 13b, В РАБОТЕ)
+### ✅ Приоритет 4.5 — доработка bot: orderbook snapshot — ГОТОВО (раздел 13b)
 
-### 13b. bot — доработка: полный снапшот стакана вместо дельты
+### 13b. bot — доработка: полный снапшот стакана вместо дельты — ЗАКРЫТО 2026-08-07
 
-**Проблема:** `market:orderbook:{symbol}` сейчас содержит последнюю
+**Коммит:** `e1dfad6` — "bot: полный снапшот стакана вместо инкрементальной
+дельты (раздел 13b)" — запушен в `master`.
+
+**Проблема (была):** `market:orderbook:{symbol}` содержал последнюю
 ИНКРЕМЕНТАЛЬНУЮ дельту стакана (`order_book_update` от Gate.io — это
 incremental channel по протоколу биржи), а не полный, поддерживаемый
 стакан. Обнаружено при проектировании P-индикатора в analyzer — для
@@ -746,26 +749,68 @@ WS-клиентом Gate.io, а НЕ analyzer, по тем же причинам
   потребителя (не только analyzer) — если стакан "доделывает" один
   consumer, второй future-consumer вынужден писать ту же логику заново
 
-**Что нужно сделать в bot:**
+**Что сделано в bot (`bot/internal/gateway/`):**
 
-1. Добавить REST-метод получения снапшота стакана (глубина 20 уровней
-   — совпадает с текущим `orderbook.depth` в `config.yaml`, глубже не
-   нужно — P работает с топом стакана, не с полной ликвидностью)
-2. При `Connect`/переподписке — сначала брать REST-снапшот, потом
-   начинать применять входящие WS-дельты поверх него
-3. Держать в памяти актуальный стакан на символ (map по symbol),
-   применять входящие дельты по `U`/`u` id обновлений
-4. При обнаружении разрыва последовательности — пересинхронизация:
-   заново REST-снапшот + переподписка на дельты для этого символа
-5. `publisher.PublishOrderBook` публикует уже ПОЛНЫЙ стакан (после
-   применения дельты), тем же ключом `market:orderbook:{symbol}` и
-   тем же форматом полей (`s`/`b`/`a`, `p`/`s` внутри уровня) — analyzer
-   уже готов к этому формату, изменений в analyzer НЕ потребуется
+1. `rest.go` — `GetOrderBookSnapshot(ctx, symbol, depth)`: `GET
+/futures/usdt/order_book?contract={symbol}&limit={depth}&with_id=true`
+   (глубина = `cfg.Orderbook.Depth` из config.yaml, та же, что и в
+   подписке на дельты — обязательное требование протокола Gate.io).
+   `OrderBookSnapshot`/`OBLevelREST` — размечены `json.Number` для
+   `size` (в REST-ответе это JSON-число, в WS — строка; расхождение
+   подтверждено прямой проверкой реального ответа биржи).
+2. `orderbook.go` (новый файл) — `LocalOrderBook`: держит стакан на
+   символ в памяти (`map[float64]bookLevel` для bids/asks — O(1)
+   обновление/удаление по цене). Реализует официальный алгоритм
+   Gate.io: `newLocalOrderBook` из REST-снапшота (`synced=false`),
+   `ApplyDelta` ищет точку стыковки (`U <= lastUpdateID+1 <= u`),
+   дальше требует `FirstU == lastUpdateID+1` на каждой следующей
+   дельте — иначе `needResync=true`. Отдельно обработан редкий случай
+   `Full=true` (биржа сама шлёt принудительный полный снапшот через
+   тот же канал) — стакан заменяется целиком. `Snapshot()` сортирует
+   bids по убыванию / asks по возрастанию цены.
+3. `connection.go` — `WSClient` получил `restClient *Client`, `books
+map[string]*LocalOrderBook` + `booksMu sync.Mutex`.
+4. `parser.go` — `handleOrderBook` переписан: применяет входящую
+   дельту к `LocalOrderBook`, публикует уже ПОЛНЫЙ стакан после
+   применения, при разрыве последовательности запускает
+   `resyncOrderBook` в отдельной горутине (не блокирует `ReadLoop` на
+   время REST-запроса).
+5. `main.go` — `InitOrderBookSnapshots` вызывается на КАЖДЫЙ
+   `subscribeAll` (в т.ч. при реконнекте — старое состояние
+   `LocalOrderBook` не годится для нового WS-соединения, там своя
+   нумерация `U`/`u`), строго ДО подписки на `order_book_update`.
+6. `publisher.PublishOrderBook` публикует уже ПОЛНЫЙ стакан тем же
+   ключом `market:orderbook:{symbol}` и тем же форматом полей
+   (`s`/`b`/`a`, `p`/`s` внутри уровня) — analyzer не потребовал
+   изменений (см. обновлённый комментарий в
+   `analyzer/internal/reader/orderbook.go`).
 
-**Статус: начинается в отдельном, специализированном чате** (см.
-приоритет 4.5 выше) — задача самодостаточна, не требует контекста
-проектирования analyzer, но требует свежего погружения в
-`bot/internal/gateway/` (parser.go, connection.go, rest.go, ws.go).
+**Проверено в build-песочнице (2026-08-07, см. SANDBOX_SETUP.md):**
+
+- `go build ./...` и `go vet ./...` на `bot/` — чисто, без замечаний
+  (Go 1.22.2 через apt, `GOTOOLCHAIN=local`, `replace` на локальные
+  клоны `go.yaml.in/yaml/v3` и `go.uber.org/atomic` — vanity-пути не
+  в allowlist песочницы).
+- Юнит-тесты на `LocalOrderBook` (5 сценариев): инициализация из
+  снапшота, точка стыковки дельты, `size:"0"` → удаление уровня,
+  разрыв последовательности → `needResync`, `Full=true` → полная
+  замена, сортировка bids/asks в `Snapshot()`. Все прошли с первого
+  раза.
+- Живой прогон: поднят локальный Redis, реальный бинарник
+  опубликовал `OrderBookFullSnapshot` через `publisher.PublishOrderBook`,
+  прочитан обратно ключ `market:orderbook:BTC_USDT` — формат
+  байт-в-байт совпал с тем, что ожидает `analyzer/internal/reader/orderbook.go`
+  (поля `t`/`s`/`b`/`a`, внутри уровня `p`/`s`).
+
+**Не проверено в песочнице (требует VDS — см. SANDBOX_SETUP.md,
+ограничение в конце):** реальное сетевое взаимодействие с Gate.io
+(живые WS-дельты `order_book_update`, реальные разрывы
+последовательности `U`/`u` на боевом потоке). До выката на msk/sgp —
+живой прогон против реальной биржи остаётся на стороне Дмитрия.
+
+**Дальше:** можно катить `analyzer` на VDS (см. раздел 5, "TODO:
+analyzer пока НЕ в deploy.sh/bootstrap.sh") — блокер снят, P будет
+считаться на корректных данных.
 
 ### Приоритет 5 — остальные новые сервисы
 
