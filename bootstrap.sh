@@ -94,10 +94,10 @@ sudo ufw status verbose
 # 5. Структура папок под деплой
 # -------------------------------------------------------
 echo "--> Создание структуры папок в ${APP_ROOT}"
-# ВАЖНО: bot и ws-server оба грузят config.yaml по относительному пути
-# "config.yaml" (захардкожено в коде) — поэтому каждому нужна СВОЯ рабочая
-# директория, иначе конфиги будут конфликтовать в одной общей bin/.
-mkdir -p "${APP_ROOT}"/{bin/bot,bin/ws-server,releases,shared/config,logs}
+# ВАЖНО: bot, ws-server и analyzer все грузят config.yaml по относительному
+# пути "config.yaml" (захардкожено в коде) — поэтому каждому нужна СВОЯ
+# рабочая директория, иначе конфиги будут конфликтовать в одной общей bin/.
+mkdir -p "${APP_ROOT}"/{bin/bot,bin/ws-server,bin/analyzer,releases,shared/config,logs}
 
 # -------------------------------------------------------
 # 6. systemd unit-файлы (шаблоны, .env подключается отдельно)
@@ -161,6 +161,41 @@ ProtectHome=false
 WantedBy=multi-user.target
 EOF
 
+# analyzer: After=dtrader-bot (не Requires=) — analyzer читает market:*
+# из Redis, которые публикует bot, поэтому стартовать имеет смысл ПОСЛЕ
+# него, но это не жёсткая зависимость. Если bot временно недоступен или
+# перезапускается, analyzer не должен падать/блокироваться — он просто
+# будет читать пустые/устаревшие ключи, пока bot не восстановится (то же
+# рассуждение, что и для dtrader-ws выше, только с analyzer вместо bot
+# как источника данных для чтения).
+sudo tee /etc/systemd/system/dtrader-analyzer.service > /dev/null <<EOF
+[Unit]
+Description=DTrader 6 - Analyzer (Redis market data -> TVP indicators)
+After=network-online.target redis-server.service dtrader-bot.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=${APP_USER}
+WorkingDirectory=${APP_ROOT}/bin/analyzer
+ExecStart=${APP_ROOT}/bin/analyzer/dtrader-analyzer
+EnvironmentFile=${APP_ROOT}/shared/config/analyzer.env
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:${APP_ROOT}/logs/analyzer.log
+StandardError=append:${APP_ROOT}/logs/analyzer.error.log
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=${APP_ROOT}/logs
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 sudo systemctl daemon-reload
 
 echo "=================================================="
@@ -170,7 +205,9 @@ echo ""
 echo "ДАЛЬШЕ ВРУЧНУЮ (один раз):"
 echo "  1. Создать ${APP_ROOT}/shared/config/bot.env"
 echo "  2. Создать ${APP_ROOT}/shared/config/ws-server.env"
-echo "  3. Положить config.yaml для bot и ws-server в ${APP_ROOT}/shared/config/"
+echo "  3. Создать ${APP_ROOT}/shared/config/analyzer.env (нужен только REDIS_PASSWORD —"
+echo "     analyzer не ходит к Gate.io и не имеет других секретов)"
+echo "  4. Положить config.yaml для bot, ws-server и analyzer в ${APP_ROOT}/shared/config/"
 echo "  (см. env.example, который пришлю отдельно — деплой-скрипт это не делает"
 echo "   автоматически из соображений безопасности секретов)"
 echo ""

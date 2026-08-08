@@ -2,18 +2,20 @@
 # deploy.sh — сборка локально + деплой на msk и sgp по SSH
 #
 # Использование:
-#   ./deploy.sh                  — деплой bot + ws-server на оба сервера
+#   ./deploy.sh                  — деплой bot + ws-server + analyzer на оба сервера
 #   ./deploy.sh bot               — деплой только bot на оба сервера
 #   ./deploy.sh ws                 — деплой только ws-server на оба сервера
+#   ./deploy.sh analyzer            — деплой только analyzer на оба сервера
 #   ./deploy.sh bot msk             — деплой только bot только на msk
 #   ./deploy.sh --config-only        — обновить только config.yaml (без пересборки)
 #
 # Требует: ~/.ssh/config с алиасами msk и sgp, локально установленный Go 1.22.3+
 #
 # Структура на сервере (создаётся bootstrap.sh):
-#   ~/dtrader-6/bin/bot/config.yaml + dtrader-bot        (WorkingDirectory для systemd)
+#   ~/dtrader-6/bin/bot/config.yaml + dtrader-bot              (WorkingDirectory для systemd)
 #   ~/dtrader-6/bin/ws-server/config.yaml + dtrader-ws
-#   ~/dtrader-6/shared/config/{bot.env,ws-server.env}    (секреты, заполняются вручную)
+#   ~/dtrader-6/bin/analyzer/config.yaml + dtrader-analyzer
+#   ~/dtrader-6/shared/config/{bot.env,ws-server.env,analyzer.env}  (секреты, заполняются вручную)
 
 set -uo pipefail
 # Примечание: -e сознательно НЕ используется здесь — при нестабильном канале
@@ -42,11 +44,12 @@ scp_retry() {
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_DIR="${REPO_ROOT}/bot"
 WS_DIR="${REPO_ROOT}/ws-server"
+ANALYZER_DIR="${REPO_ROOT}/analyzer"
 REMOTE_APP_ROOT="dtrader-6"
 HOSTS=(msk sgp)
 BUILD_DIR="${REPO_ROOT}/.build"
 
-TARGET="${1:-all}"          # all | bot | ws | --config-only
+TARGET="${1:-all}"          # all | bot | ws | analyzer | --config-only
 ONLY_HOST="${2:-}"          # если задан — деплоим только на этот хост
 
 if [[ -n "${ONLY_HOST}" ]]; then
@@ -65,12 +68,14 @@ mkdir -p "${BUILD_DIR}"
 
 deploy_bot="false"
 deploy_ws="false"
+deploy_analyzer="false"
 case "${TARGET}" in
-    all) deploy_bot="true"; deploy_ws="true" ;;
+    all) deploy_bot="true"; deploy_ws="true"; deploy_analyzer="true" ;;
     bot) deploy_bot="true" ;;
     ws)  deploy_ws="true" ;;
-    --config-only) deploy_bot="true"; deploy_ws="true" ;;
-    *) echo "❌ Неизвестный таргет: ${TARGET} (используй: all | bot | ws | --config-only)"; exit 1 ;;
+    analyzer) deploy_analyzer="true" ;;
+    --config-only) deploy_bot="true"; deploy_ws="true"; deploy_analyzer="true" ;;
+    *) echo "❌ Неизвестный таргет: ${TARGET} (используй: all | bot | ws | analyzer | --config-only)"; exit 1 ;;
 esac
 
 # -------------------------------------------------------
@@ -89,6 +94,12 @@ if [[ "${TARGET}" != "--config-only" ]]; then
             go build -ldflags="-s -w" -o "${BUILD_DIR}/dtrader-ws" ./cmd)
         echo "✅ ws-server собран: $(du -h "${BUILD_DIR}/dtrader-ws" | cut -f1)"
     fi
+    if [[ "${deploy_analyzer}" == "true" ]]; then
+        echo "🔨 Сборка analyzer (linux/amd64)..."
+        (cd "${ANALYZER_DIR}" && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -ldflags="-s -w" -o "${BUILD_DIR}/dtrader-analyzer" ./cmd)
+        echo "✅ analyzer собран: $(du -h "${BUILD_DIR}/dtrader-analyzer" | cut -f1)"
+    fi
 fi
 
 # -------------------------------------------------------
@@ -106,13 +117,17 @@ deploy_to_host() {
     if [[ "${deploy_ws}" == "true" ]]; then
         scp_retry "${WS_DIR}/config.yaml" "${host}:${remote}/bin/ws-server/config.yaml.new" || return 1
     fi
+    if [[ "${deploy_analyzer}" == "true" ]]; then
+        scp_retry "${ANALYZER_DIR}/config.yaml" "${host}:${remote}/bin/analyzer/config.yaml.new" || return 1
+    fi
 
     if [[ "${TARGET}" == "--config-only" ]]; then
         ssh "${host}" bash -s <<EOF
 set -e
 [[ -f ${remote}/bin/bot/config.yaml.new ]] && mv ${remote}/bin/bot/config.yaml.new ${remote}/bin/bot/config.yaml
 [[ -f ${remote}/bin/ws-server/config.yaml.new ]] && mv ${remote}/bin/ws-server/config.yaml.new ${remote}/bin/ws-server/config.yaml
-sudo systemctl restart dtrader-bot dtrader-ws
+[[ -f ${remote}/bin/analyzer/config.yaml.new ]] && mv ${remote}/bin/analyzer/config.yaml.new ${remote}/bin/analyzer/config.yaml
+sudo systemctl restart dtrader-bot dtrader-ws dtrader-analyzer
 echo "  ✅ config.yaml обновлён, сервисы перезапущены"
 EOF
         return
@@ -123,6 +138,9 @@ EOF
     fi
     if [[ "${deploy_ws}" == "true" ]]; then
         scp_retry "${BUILD_DIR}/dtrader-ws" "${host}:${remote}/bin/ws-server/dtrader-ws.new" || return 1
+    fi
+    if [[ "${deploy_analyzer}" == "true" ]]; then
+        scp_retry "${BUILD_DIR}/dtrader-analyzer" "${host}:${remote}/bin/analyzer/dtrader-analyzer.new" || return 1
     fi
 
     ssh "${host}" bash -s <<EOF
@@ -144,12 +162,23 @@ if [[ "${deploy_ws}" == "true" ]]; then
     sudo systemctl restart dtrader-ws
 fi
 
+if [[ "${deploy_analyzer}" == "true" ]]; then
+    cd ${remote}/bin/analyzer
+    chmod +x dtrader-analyzer.new
+    mv dtrader-analyzer.new dtrader-analyzer
+    [[ -f config.yaml.new ]] && mv config.yaml.new config.yaml
+    sudo systemctl restart dtrader-analyzer
+fi
+
 sleep 1
 if [[ "${deploy_bot}" == "true" ]]; then
     sudo systemctl is-active --quiet dtrader-bot && echo "  ✅ dtrader-bot: active" || { echo "  ❌ dtrader-bot: НЕ АКТИВЕН"; sudo journalctl -u dtrader-bot -n 15 --no-pager; }
 fi
 if [[ "${deploy_ws}" == "true" ]]; then
     sudo systemctl is-active --quiet dtrader-ws && echo "  ✅ dtrader-ws: active" || { echo "  ❌ dtrader-ws: НЕ АКТИВЕН"; sudo journalctl -u dtrader-ws -n 15 --no-pager; }
+fi
+if [[ "${deploy_analyzer}" == "true" ]]; then
+    sudo systemctl is-active --quiet dtrader-analyzer && echo "  ✅ dtrader-analyzer: active" || { echo "  ❌ dtrader-analyzer: НЕ АКТИВЕН"; sudo journalctl -u dtrader-analyzer -n 15 --no-pager; }
 fi
 EOF
 }

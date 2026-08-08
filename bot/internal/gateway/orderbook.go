@@ -260,7 +260,18 @@ func (c *WSClient) InitOrderBookSnapshots(ctx context.Context, symbols []string,
 // ctx берётся с коротким таймаутом отдельно от общего жизненного цикла
 // соединения — пересинхронизация не должна виснуть дольше, чем на разумный
 // REST-запрос, даже если основной ctx ещё долго не отменится.
+//
+// Вызывающий код (parser.go) обязан выставить c.resyncing[symbol]=true
+// ДО запуска этой горутины — здесь только гарантированный сброс флага по
+// завершении (через defer), чтобы символ не остался навсегда
+// заблокированным для будущих resync, даже если REST-запрос упал с ошибкой.
 func (c *WSClient) resyncOrderBook(symbol string, depth int) {
+	defer func() {
+		c.booksMu.Lock()
+		delete(c.resyncing, symbol)
+		c.booksMu.Unlock()
+	}()
+
 	if c.restClient == nil {
 		return
 	}

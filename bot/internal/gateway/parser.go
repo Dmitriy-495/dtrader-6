@@ -107,6 +107,23 @@ func (c *WSClient) handleOrderBook(ctx context.Context, raw json.RawMessage) {
 		if depth == 0 {
 			depth = len(ob.Asks)
 		}
+
+		// Пока идёт resync (REST-запрос занимает сотни мс), ReadLoop
+		// продолжает получать и обрабатывать следующие дельты на СТАРОМ
+		// c.books[ob.S] — каждая из них снова обнаружит несостыковку и
+		// без этой проверки запускала бы ЕЩЁ ОДИН параллельный
+		// resyncOrderBook на тот же символ (см. комментарий у поля
+		// resyncing в connection.go). Один resync на символ одновременно.
+		c.booksMu.Lock()
+		alreadyResyncing := c.resyncing[ob.S]
+		if !alreadyResyncing {
+			c.resyncing[ob.S] = true
+		}
+		c.booksMu.Unlock()
+
+		if alreadyResyncing {
+			return
+		}
 		go c.resyncOrderBook(ob.S, depth)
 		return
 	}
