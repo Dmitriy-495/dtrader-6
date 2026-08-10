@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/gorilla/websocket"
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/publisher"
+	"github.com/gorilla/websocket"
 )
 
 // WSClient — WebSocket-клиент Gate.io Futures.

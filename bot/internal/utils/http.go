@@ -10,9 +10,10 @@ import (
 // AuthHeaders добавляет заголовки авторизации Gate.io к HTTP запросу.
 //
 // Gate.io требует для приватных endpoints:
-//   KEY       : API ключ
-//   SIGN      : HMAC-SHA512 подпись запроса
-//   Timestamp : время запроса в секундах Unix
+//
+//	KEY       : API ключ
+//	SIGN      : HMAC-SHA512 подпись запроса
+//	Timestamp : время запроса в секундах Unix
 //
 // Вызывается ПОСЛЕ setCommonHeaders в client.go —
 // не дублирует Content-Type, Accept, User-Agent.

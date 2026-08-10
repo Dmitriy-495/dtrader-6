@@ -2,9 +2,10 @@
 // Этот файл реализует базовый HTTP клиент для REST API запросов.
 //
 // Архитектура пакета:
-//   constants.go — константы пакета
-//   client.go    — низкоуровневый HTTP клиент (этот файл)
-//   rest.go      — высокоуровневые методы: Ping, Balance, Positions
+//
+//	constants.go — константы пакета
+//	client.go    — низкоуровневый HTTP клиент (этот файл)
+//	rest.go      — высокоуровневые методы: Ping, Balance, Positions
 package gateway
 
 import (
@@ -50,8 +51,9 @@ func NewClient(apiKey, secret, baseURL string) *Client {
 // Приватный метод — используется только внутри пакета gateway.
 //
 // Примеры:
-//   buildURL("/futures/usdt/accounts", "")         → "https://.../futures/usdt/accounts"
-//   buildURL("/futures/usdt/contracts", "limit=1") → "https://.../futures/usdt/contracts?limit=1"
+//
+//	buildURL("/futures/usdt/accounts", "")         → "https://.../futures/usdt/accounts"
+//	buildURL("/futures/usdt/contracts", "limit=1") → "https://.../futures/usdt/contracts?limit=1"
 func (c *Client) buildURL(endpoint, query string) string {
 	url := c.baseURL + endpoint
 	if query != "" {

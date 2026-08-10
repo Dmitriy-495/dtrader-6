@@ -30,14 +30,15 @@ import (
 // SignREST формирует подпись для REST API запросов Gate.io.
 //
 // Gate.io REST API требует следующий формат signature_string:
-//   METHOD\n/api/v4/path\nquery_string\nSHA512(body)\ntimestamp
+//
+//	METHOD\n/api/v4/path\nquery_string\nSHA512(body)\ntimestamp
 //
 // Параметры:
 //   - secret    : API Secret из .env (GATE_API_SECRET)
 //   - method    : HTTP метод в верхнем регистре ("GET", "POST")
 //   - path      : путь запроса БЕЗ хоста, например "/api/v4/futures/usdt/accounts"
 //   - query     : строка параметров запроса, например "limit=10&offset=0"
-//                 пустая строка "" если параметров нет
+//     пустая строка "" если параметров нет
 //   - body      : тело запроса в виде строки (для GET запросов — пустая строка "")
 //   - timestamp : текущее время в секундах Unix (int64)
 //
@@ -51,7 +52,7 @@ func SignREST(secret, method, path, query, body string, timestamp int64) string 
 	// Write() записывает данные в хэшер (можно вызывать несколько раз).
 	// Sum(nil) возвращает итоговый хэш в виде байтового среза []byte.
 	bodyHasher := sha512.New()
-	bodyHasher.Write([]byte(body))                    // записываем тело в хэшер
+	bodyHasher.Write([]byte(body))                      // записываем тело в хэшер
 	bodyHash := hex.EncodeToString(bodyHasher.Sum(nil)) // конвертируем байты в hex строку
 
 	// ШАГ 2: Формируем signature_string по требованию Gate.io.
@@ -85,7 +86,8 @@ func SignREST(secret, method, path, query, body string, timestamp int64) string 
 // SignWS формирует подпись для WebSocket запросов Gate.io.
 //
 // Gate.io WebSocket API требует другой формат signature_string:
-//   channel=<channel>&event=<event>&time=<timestamp>
+//
+//	channel=<channel>&event=<event>&time=<timestamp>
 //
 // Параметры:
 //   - secret    : API Secret из .env (GATE_API_SECRET)
