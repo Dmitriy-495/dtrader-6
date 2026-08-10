@@ -1,6 +1,8 @@
 # Секреты — никогда не коммитим!
 .env
 .redispwd
+*.env
+shared/config/*.env
 
 # Бинарники Go
 *.exe
