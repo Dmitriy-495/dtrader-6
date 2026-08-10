@@ -136,6 +136,70 @@ func TestApplyDelta_FullReplacesBook(t *testing.T) {
 	}
 }
 
+// --- 5b. Устаревший Full=true (u.U <= lastUpdateID) должен игнорироваться,
+// а не откатывать уже применённые более свежие данные назад. Регрессионный
+// тест на находку из независимого аудита (агент OpenCode/Sonnet-5,
+// 2026-08-10): без этой проверки переупорядоченный на сети/буферизованный
+// устаревший full-пакет молча откатывал бы стакан в прошлое.
+
+func TestApplyDelta_StaleFullSnapshotIgnored(t *testing.T) {
+	snap := newTestSnapshot(100, []OBLevelREST{lvlREST("50000", "1.5")}, nil)
+	lob := newLocalOrderBook("BTC_USDT", snap)
+
+	// Сначала применяем свежий full с u.U=200 — стакан продвигается вперёд.
+	freshFull := OrderBookUpdate{
+		S: "BTC_USDT", Full: true, U: 200,
+		Bids: []OBLevel{lvl("51000", "3.0")},
+	}
+	applied, needResync := lob.ApplyDelta(freshFull)
+	if !applied || needResync {
+		t.Fatalf("fresh full: applied=%v needResync=%v, want true/false", applied, needResync)
+	}
+
+	// Теперь приходит УСТАРЕВШИЙ full с u.U=150 (< 200) — переупорядоченный
+	// на сети пакет, отправленный сервером раньше, чем предыдущий. Должен
+	// быть проигнорирован целиком: не применяться, не считаться ошибкой
+	// (needResync=false — это не разрыв последовательности, а просто
+	// нерелевантный, устаревший пакет).
+	staleFull := OrderBookUpdate{
+		S: "BTC_USDT", Full: true, U: 150,
+		Bids: []OBLevel{lvl("49000", "9.0")}, // если бы применился — стакан откатился бы
+	}
+	applied, needResync = lob.ApplyDelta(staleFull)
+	if applied || needResync {
+		t.Errorf("stale full: applied=%v needResync=%v, want false/false (должен молча игнорироваться)", applied, needResync)
+	}
+
+	// Состояние стакана должно остаться ТАКИМ ЖЕ, как после freshFull —
+	// устаревший пакет не должен был повлиять вообще ни на что.
+	if lob.lastUpdateID != 200 {
+		t.Errorf("lastUpdateID = %d после устаревшего full, want 200 (не должен был измениться)", lob.lastUpdateID)
+	}
+	if _, exists := lob.bids[51000]; !exists {
+		t.Error("уровень 51000 из freshFull должен остаться на месте")
+	}
+	if _, exists := lob.bids[49000]; exists {
+		t.Error("уровень 49000 из staleFull НЕ должен был примениться")
+	}
+}
+
+// --- 5c. Full=true с u.U РАВНЫМ lastUpdateID (не только меньше) тоже
+// должен игнорироваться как устаревший/дублирующийся, не как ошибка.
+
+func TestApplyDelta_FullSnapshotWithSameUIgnored(t *testing.T) {
+	snap := newTestSnapshot(100, nil, nil)
+	lob := newLocalOrderBook("BTC_USDT", snap)
+
+	full := OrderBookUpdate{S: "BTC_USDT", Full: true, U: 100, Bids: []OBLevel{lvl("50000", "1")}}
+	applied, needResync := lob.ApplyDelta(full)
+	if applied || needResync {
+		t.Errorf("full с u.U == lastUpdateID: applied=%v needResync=%v, want false/false", applied, needResync)
+	}
+	if _, exists := lob.bids[50000]; exists {
+		t.Error("уровень не должен был примениться — u.U равен, а не больше lastUpdateID")
+	}
+}
+
 // --- 6. Snapshot() сортирует bids по убыванию, asks по возрастанию ---
 
 func TestSnapshot_SortsLevels(t *testing.T) {

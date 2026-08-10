@@ -5,11 +5,20 @@
 //
 // Реализует официальный алгоритм Gate.io для локального стакана
 // (см. https://www.gate.com/docs/developers/futures/ws/en/#order-book-api,
-// раздел "How to maintain local order book"):
+// раздел "How to maintain local order book"). Документация Gate.io
+// описывает это в терминах "U" (начало диапазона дельты) и "u" (конец
+// диапазона дельты) — НО в нашем коде (см. OrderBookUpdate в protocol.go)
+// поле называется FirstU (= "U" из документации, начало диапазона) и
+// поле U (= "u" из документации, конец диапазона, совпадает с полем "u"
+// в оригинальном ответе биржи под тем же JSON-ключом "u"). Не путать
+// поле u.FirstU с "верхней" u из документации — это разные вещи, несмотря
+// на похожие названия.
+//
 //  1. Подписаться на order_book_update с нужной глубиной/частотой
 //  2. Взять REST-снапшот с with_id=true → получить базовый id
-//  3. Найти первую дельту, которая "накрывает" этот id (U <= id+1 <= u)
-//  4. Применять дельты по цепочке (каждая следующая: U == prev_u + 1)
+//  3. Найти первую дельту, которая "накрывает" этот id:
+//     u.FirstU <= id+1 <= u.U
+//  4. Применять дельты по цепочке (каждая следующая: u.FirstU == prev.U + 1)
 //  5. При разрыве последовательности — заново снапшот + пересинхронизация
 //
 // Раньше bot публиковал в Redis последнюю ИНКРЕМЕНТАЛЬНУЮ дельту как есть
@@ -27,12 +36,11 @@ import (
 )
 
 // bookLevel — один уровень стакана в представлении, удобном для хранения
-// и обновления: цена как float64 (чтобы сравнивать/сортировать без разбора
-// строк на каждой операции) + оригинальная строка размера (публикуем в
-// Redis строками, как их присылает биржа — не хотим потерять точность
-// форматирования decimal-значений через промежуточный float64).
+// и обновления. Ключом карты (map[float64]bookLevel) уже служит цена —
+// поэтому сам bookLevel хранит только size (в исходном строковом виде,
+// как прислала биржа — не хотим терять точность форматирования decimal-
+// значений через промежуточный float64) и priceStr для публикации.
 type bookLevel struct {
-	price    float64
 	sizeStr  string
 	priceStr string
 }
@@ -92,7 +100,7 @@ func (lob *LocalOrderBook) setLevel(levels map[float64]bookLevel, priceStr, size
 		log.Printf("⚠️ orderbook %s: не удалось разобрать цену %q: %v", lob.symbol, priceStr, err)
 		return
 	}
-	levels[price] = bookLevel{price: price, sizeStr: sizeStr, priceStr: priceStr}
+	levels[price] = bookLevel{sizeStr: sizeStr, priceStr: priceStr}
 }
 
 // removeLevel удаляет уровень по цене — вызывается, когда входящая дельта
@@ -120,8 +128,19 @@ func (lob *LocalOrderBook) ApplyDelta(u OrderBookUpdate) (applied bool, needResy
 		// По официальной документации: "the local order book should be
 		// completely replaced" — не применяем как дельту (не проверяем
 		// U/u стыковку), а заменяем bids/asks целиком, как при инициализации
-		// из REST. Сам факт получения такого сообщения уже равнозначен
-		// новой точке стыковки — lastUpdateID берём из u.U.
+		// из REST.
+		//
+		// Проверяем монотонность u.U перед заменой: если это устаревшее
+		// full-сообщение пришло ПОСЛЕ более новых дельт (переупорядочивание
+		// на сети/буферизация), применение отбросило бы уже применённые
+		// более свежие обновления назад — молча, без единого сигнала.
+		// Устаревший full просто игнорируем: свежее состояние уже лучше,
+		// чем то, что несёт с собой этот пакет.
+		if u.U <= lob.lastUpdateID {
+			log.Printf("⚠️ orderbook %s: устаревший full-снапшот проигнорирован (u.U=%d <= lastUpdateID=%d)",
+				lob.symbol, u.U, lob.lastUpdateID)
+			return false, false
+		}
 		lob.bids = make(map[float64]bookLevel, len(u.Bids))
 		lob.asks = make(map[float64]bookLevel, len(u.Asks))
 		for _, lvl := range u.Bids {
@@ -132,19 +151,20 @@ func (lob *LocalOrderBook) ApplyDelta(u OrderBookUpdate) (applied bool, needResy
 		}
 		lob.lastUpdateID = u.U
 		lob.synced = true
+		log.Printf("🔄 [orderbook] принудительный full-replace от сервера: %s id=%d bids=%d asks=%d",
+			lob.symbol, u.U, len(u.Bids), len(u.Asks))
 		return true, false
 	}
 
 	if !lob.synced {
 		// Ищем точку стыковки со снапшотом: официальный алгоритм Gate.io
-		// требует U <= lastUpdateID+1 <= u. Если эта дельта "старше" снапшота
-		// (её диапазон весь ниже нужной точки) — просто ждём следующую,
-		// это НЕ ошибка, а нормальная ситуация сразу после инициализации.
+		// требует "U <= id+1 <= u" (в терминах документации) — в терминах
+		// наших полей это u.FirstU <= lastUpdateID+1 <= u.U. Если эта
+		// дельта "новее" точки стыковки (весь её диапазон выше нужного) —
+		// нужная дельта, видимо, была раньше и уже потеряна.
 		if u.FirstU > lob.lastUpdateID+1 {
-			// Дельта "новее", чем нужная точка стыковки — значит нужная
-			// дельта, видимо, была раньше и уже потеряна (не кэшировали
-			// историю дельт в этой упрощённой реализации). Идём на
-			// пересинхронизацию, а не пытаемся угадать пропущенное.
+			// (не кэшировали историю дельт в этой упрощённой реализации).
+			// Идём на пересинхронизацию, а не пытаемся угадать пропущенное.
 			return false, true
 		}
 		if u.U < lob.lastUpdateID+1 {
@@ -153,13 +173,13 @@ func (lob *LocalOrderBook) ApplyDelta(u OrderBookUpdate) (applied bool, needResy
 			// свежего REST-снапшота.
 			return false, false
 		}
-		// U <= lastUpdateID+1 <= u — нашли точку стыковки, начинаем применять.
+		// u.FirstU <= lastUpdateID+1 <= u.U — нашли точку стыковки, начинаем применять.
 		lob.synced = true
 	} else if u.FirstU != lob.lastUpdateID+1 {
-		// Уже синхронизированы, но пришла дельта не следующая по цепочке —
-		// разрыв последовательности, часть обновлений потеряна.
-		// Официальный алгоритм требует полной пересинхронизации в этом
-		// случае — не пытаемся частично залатать дыру.
+		// Уже синхронизированы, но пришла дельта не следующая по цепочке
+		// (её u.FirstU не равен lastUpdateID+1) — разрыв последовательности,
+		// часть обновлений потеряна. Официальный алгоритм требует полной
+		// пересинхронизации в этом случае — не пытаемся частично залатать дыру.
 		return false, true
 	}
 
@@ -198,26 +218,37 @@ type OrderBookFullSnapshot struct {
 // bids отсортированы по убыванию цены (лучшая покупка сверху), asks по
 // возрастанию (лучшая продажа сверху) — так же, как обычно показывают
 // стакан в любом торговом интерфейсе, включая будущий TUI.
+//
+// Цена уже присутствует как ключ карты (map[float64]bookLevel) — сортируем
+// по нему напрямую, без повторного strconv.ParseFloat на каждую публикацию
+// снапшота (float64-цена парсится один раз, в setLevel, при вставке/
+// обновлении уровня — здесь она просто переиспользуется как ключ).
 func (lob *LocalOrderBook) Snapshot(tsMs int64) OrderBookFullSnapshot {
-	bids := make([]OBLevel, 0, len(lob.bids))
-	for _, lvl := range lob.bids {
+	bidPrices := make([]float64, 0, len(lob.bids))
+	for price := range lob.bids {
+		bidPrices = append(bidPrices, price)
+	}
+	sort.Slice(bidPrices, func(i, j int) bool {
+		return bidPrices[i] > bidPrices[j] // убывание — лучшая (самая высокая) покупка первая
+	})
+	bids := make([]OBLevel, 0, len(bidPrices))
+	for _, price := range bidPrices {
+		lvl := lob.bids[price]
 		bids = append(bids, OBLevel{Price: lvl.priceStr, Size: lvl.sizeStr})
 	}
-	sort.Slice(bids, func(i, j int) bool {
-		pi, _ := strconv.ParseFloat(bids[i].Price, 64)
-		pj, _ := strconv.ParseFloat(bids[j].Price, 64)
-		return pi > pj // убывание — лучшая (самая высокая) покупка первая
-	})
 
-	asks := make([]OBLevel, 0, len(lob.asks))
-	for _, lvl := range lob.asks {
+	askPrices := make([]float64, 0, len(lob.asks))
+	for price := range lob.asks {
+		askPrices = append(askPrices, price)
+	}
+	sort.Slice(askPrices, func(i, j int) bool {
+		return askPrices[i] < askPrices[j] // возрастание — лучшая (самая низкая) продажа первая
+	})
+	asks := make([]OBLevel, 0, len(askPrices))
+	for _, price := range askPrices {
+		lvl := lob.asks[price]
 		asks = append(asks, OBLevel{Price: lvl.priceStr, Size: lvl.sizeStr})
 	}
-	sort.Slice(asks, func(i, j int) bool {
-		pi, _ := strconv.ParseFloat(asks[i].Price, 64)
-		pj, _ := strconv.ParseFloat(asks[j].Price, 64)
-		return pi < pj // возрастание — лучшая (самая низкая) продажа первая
-	})
 
 	return OrderBookFullSnapshot{T: tsMs, S: lob.symbol, Bids: bids, Asks: asks}
 }
