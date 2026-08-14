@@ -27,7 +27,7 @@ func TestNewLocalOrderBook_InitFromSnapshot(t *testing.T) {
 		[]OBLevelREST{lvlREST("50000", "1.5"), lvlREST("49999", "2.0")},
 		[]OBLevelREST{lvlREST("50001", "1.0")},
 	)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	if lob.lastUpdateID != 100 {
 		t.Errorf("lastUpdateID = %d, want 100", lob.lastUpdateID)
@@ -44,7 +44,7 @@ func TestNewLocalOrderBook_InitFromSnapshot(t *testing.T) {
 
 func TestApplyDelta_FindsSyncPoint(t *testing.T) {
 	snap := newTestSnapshot(100, nil, nil)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	// Дельта целиком старше точки стыковки (u < 101) — пропускаем, не ошибка.
 	stale := OrderBookUpdate{S: "BTC_USDT", FirstU: 90, U: 99, Bids: []OBLevel{lvl("50000", "1")}}
@@ -74,7 +74,7 @@ func TestApplyDelta_FindsSyncPoint(t *testing.T) {
 
 func TestApplyDelta_ZeroSizeRemovesLevel(t *testing.T) {
 	snap := newTestSnapshot(100, []OBLevelREST{lvlREST("50000", "1.5")}, nil)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	// Синхронизируемся первой дельтой.
 	sync := OrderBookUpdate{S: "BTC_USDT", FirstU: 101, U: 101}
@@ -94,7 +94,7 @@ func TestApplyDelta_ZeroSizeRemovesLevel(t *testing.T) {
 
 func TestApplyDelta_GapTriggersResync(t *testing.T) {
 	snap := newTestSnapshot(100, nil, nil)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	sync := OrderBookUpdate{S: "BTC_USDT", FirstU: 101, U: 101}
 	lob.ApplyDelta(sync)
@@ -111,7 +111,7 @@ func TestApplyDelta_GapTriggersResync(t *testing.T) {
 
 func TestApplyDelta_FullReplacesBook(t *testing.T) {
 	snap := newTestSnapshot(100, []OBLevelREST{lvlREST("50000", "1.5")}, nil)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	full := OrderBookUpdate{
 		S: "BTC_USDT", Full: true, U: 200,
@@ -144,7 +144,7 @@ func TestApplyDelta_FullReplacesBook(t *testing.T) {
 
 func TestApplyDelta_StaleFullSnapshotIgnored(t *testing.T) {
 	snap := newTestSnapshot(100, []OBLevelREST{lvlREST("50000", "1.5")}, nil)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	// Сначала применяем свежий full с u.U=200 — стакан продвигается вперёд.
 	freshFull := OrderBookUpdate{
@@ -188,7 +188,7 @@ func TestApplyDelta_StaleFullSnapshotIgnored(t *testing.T) {
 
 func TestApplyDelta_FullSnapshotWithSameUIgnored(t *testing.T) {
 	snap := newTestSnapshot(100, nil, nil)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	full := OrderBookUpdate{S: "BTC_USDT", Full: true, U: 100, Bids: []OBLevel{lvl("50000", "1")}}
 	applied, needResync := lob.ApplyDelta(full)
@@ -207,7 +207,7 @@ func TestSnapshot_SortsLevels(t *testing.T) {
 		[]OBLevelREST{lvlREST("49999", "1"), lvlREST("50001", "1"), lvlREST("50000", "1")},
 		[]OBLevelREST{lvlREST("50003", "1"), lvlREST("50002", "1")},
 	)
-	lob := newLocalOrderBook("BTC_USDT", snap)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
 
 	out := lob.Snapshot(1234)
 	if len(out.Bids) != 3 || out.Bids[0].Price != "50001" || out.Bids[2].Price != "49999" {
@@ -230,25 +230,26 @@ func TestSnapshot_SortsLevels(t *testing.T) {
 // несостыковку lastUpdateID на старом объекте LocalOrderBook. Без
 // проверки c.resyncing каждая такая дельта запускала бы ЕЩЁ ОДИН
 // параллельный REST-запрос на пересинхронизацию.
+//
+// Вызывает РЕАЛЬНЫЙ c.tryStartResync — тот же метод, что использует
+// handleOrderBook в продакшн-коде (parser.go), а не его копию. Раньше
+// (до независимого аудита — OpenCode + Claude Sonnet 5, 2026-08-10)
+// этот тест копировал логику guard'а прямо в теле теста, из-за чего
+// регрессия именно в handleOrderBook (например, при случайной
+// перестановке Lock/Unlock) не была бы поймана этим тестом — он
+// проверял бы отдельную, не связанную с реальным кодом копию.
 func TestResyncGuard_PreventsParallelResyncForSameSymbol(t *testing.T) {
 	c := NewWSClient("wss://test", "", "", nil, nil) // restClient=nil — resyncOrderBook сам не выполнится
 	symbol := "BTC_USDT"
 
-	// Симулируем: 5 "потоков" одновременно пытаются пометить символ как
-	// resyncing — ровно так, как это делает handleOrderBook под c.booksMu.
+	// 5 горутин одновременно вызывают настоящий tryStartResync.
 	var wg sync.WaitGroup
 	started := make([]bool, 5)
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			c.booksMu.Lock()
-			alreadyResyncing := c.resyncing[symbol]
-			if !alreadyResyncing {
-				c.resyncing[symbol] = true
-			}
-			c.booksMu.Unlock()
-			started[idx] = !alreadyResyncing
+			started[idx] = c.tryStartResync(symbol)
 		}(i)
 	}
 	wg.Wait()
@@ -260,20 +261,17 @@ func TestResyncGuard_PreventsParallelResyncForSameSymbol(t *testing.T) {
 		}
 	}
 	if successCount != 1 {
-		t.Errorf("ровно один вызов должен был получить право на resync, получили %d из 5", successCount)
+		t.Errorf("ровно один вызов tryStartResync должен был получить право на resync, получили %d из 5", successCount)
 	}
 
 	// После сброса флага (как это делает defer в resyncOrderBook) —
-	// следующий вызов снова должен получить право на resync.
+	// следующий вызов tryStartResync снова должен получить право на resync.
 	c.booksMu.Lock()
 	delete(c.resyncing, symbol)
 	c.booksMu.Unlock()
 
-	c.booksMu.Lock()
-	alreadyResyncing := c.resyncing[symbol]
-	c.booksMu.Unlock()
-	if alreadyResyncing {
-		t.Error("после сброса флага resyncing символ не должен считаться занятым")
+	if !c.tryStartResync(symbol) {
+		t.Error("после сброса флага resyncing tryStartResync должен снова вернуть true")
 	}
 }
 
@@ -297,5 +295,44 @@ func TestResyncOrderBook_ClearsFlagOnFailure(t *testing.T) {
 
 	if stillResyncing {
 		t.Error("флаг resyncing должен быть снят через defer, даже когда restClient == nil")
+	}
+}
+
+// --- 9. Depth() возвращает реально переданную глубину снапшота, а не
+// что-то производное от текущего содержимого стакана или дельты.
+//
+// Регрессионный тест на находку из независимого аудита parser.go (агент
+// OpenCode/Sonnet-5, 2026-08-10): раньше глубина для resync ошибочно
+// вычислялась в handleOrderBook (parser.go) как len(ob.Bids)/len(ob.Asks)
+// — длина ТЕКУЩЕЙ ВХОДЯЩЕЙ ДЕЛЬТЫ, которая почти всегда намного меньше
+// полной глубины стакана (дельта обычно содержит лишь несколько
+// изменившихся уровней). Теперь глубина хранится в самом LocalOrderBook
+// при создании и читается через Depth() — не зависит от размера
+// последующих дельт.
+
+func TestLocalOrderBook_DepthIsIndependentOfSnapshotContent(t *testing.T) {
+	// Снапшот содержит всего 2 уровня bids, 1 уровень asks — но был
+	// запрошен с глубиной 20 (как реально бывает на низколиквидных
+	// парах: биржа прислала меньше уровней, чем позволял limit).
+	snap := newTestSnapshot(100,
+		[]OBLevelREST{lvlREST("50000", "1"), lvlREST("49999", "1")},
+		[]OBLevelREST{lvlREST("50001", "1")},
+	)
+	lob := newLocalOrderBook("BTC_USDT", snap, 20)
+
+	if lob.Depth() != 20 {
+		t.Errorf("Depth() = %d, want 20 (запрошенная глубина, не длина bids/asks в снапшоте)", lob.Depth())
+	}
+
+	// Применяем дельту с ещё меньшим числом уровней (типичная дельта —
+	// 1 изменившийся уровень) — Depth() не должен измениться.
+	tinyDelta := OrderBookUpdate{
+		S: "BTC_USDT", FirstU: 101, U: 101,
+		Bids: []OBLevel{lvl("50000", "2")},
+	}
+	lob.ApplyDelta(tinyDelta)
+
+	if lob.Depth() != 20 {
+		t.Errorf("Depth() после дельты = %d, want 20 (не должен зависеть от размера дельты)", lob.Depth())
 	}
 }

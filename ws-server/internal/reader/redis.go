@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/Dmitriy-495/dtrader-6/ws-server/internal/hub"
+	"github.com/redis/go-redis/v9"
 )
 
 // Reader — читает данные из Redis и транслирует клиентам через Hub.
@@ -33,6 +33,7 @@ func (r *Reader) RunAll(ctx context.Context) {
 		go r.pollOrderBook(ctx, symbol)
 		go r.pollStats(ctx, symbol)
 		go r.pollCandles(ctx, symbol)
+		go r.pollIndicators(ctx, symbol)
 	}
 	log.Printf("📡 Reader: запущены горутины для %d символов", len(r.symbols))
 }
@@ -262,6 +263,95 @@ func (r *Reader) pollCandles(ctx context.Context, symbol string) {
 	}
 }
 
+// IndicatorsMsg — объединённый снапшот T/V/P от analyzer для одного
+// символа, публикуется в новом канале "indicators". Analyzer пишет их
+// как 7 раздельных ключей в Redis (indicators:trend:{tf}:{symbol} на
+// каждый из 1m/8m/24m, indicators:volume:{tf}:{symbol} аналогично,
+// indicators:pressure:{symbol} без {tf} — раздел 6 CHECKPOINT.md).
+// ws-server объединяет их в ОДНО сообщение на символ — TUI получает
+// цельный, согласованный снапшот за один тик, а не 7 разрозненных
+// частичных обновлений, которые пришлось бы склеивать на клиенте.
+type IndicatorsMsg struct {
+	Trend    map[string]json.RawMessage `json:"trend"`    // ключ — таймфрейм ("1m"/"8m"/"24m")
+	Volume   map[string]json.RawMessage `json:"volume"`   // ключ — таймфрейм
+	Pressure json.RawMessage            `json:"pressure"` // без таймфрейма
+}
+
+// indicatorTimeframes — таймфреймы, на которых analyzer считает T/V.
+// Захардкожено здесь же, а не читается из конфига analyzer — ws-server
+// не должен зависеть от config.yaml другого сервиса; если состав ТФ
+// изменится в analyzer, эту константу нужно будет обновить вручную
+// (в паре мест кода, не автоматически — осознанный компромисс простоты
+// для v1, см. раздел 13a CHECKPOINT.md про сами таймфреймы).
+var indicatorTimeframes = []string{"1m", "8m", "24m"}
+
+// pollIndicators читает T/V/P (indicators:*) для одного символа и
+// отправляет объединённым сообщением, только когда содержимое реально
+// изменилось — тот же паттерн, что pollStats/pollCandles выше.
+// Интервал 5s синхронизирован с calc_interval analyzer по умолчанию
+// (config.yaml analyzer) — опрашивать чаще бессмысленно, значения
+// физически не обновятся раньше следующего расчётного тика analyzer.
+func (r *Reader) pollIndicators(ctx context.Context, symbol string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var lastRaw string
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			msg := IndicatorsMsg{
+				Trend:  make(map[string]json.RawMessage, len(indicatorTimeframes)),
+				Volume: make(map[string]json.RawMessage, len(indicatorTimeframes)),
+			}
+			anyFound := false
+
+			for _, tf := range indicatorTimeframes {
+				if val, err := r.rdb.Get(ctx, fmt.Sprintf("indicators:trend:%s:%s", tf, symbol)).Result(); err == nil {
+					msg.Trend[tf] = json.RawMessage(val)
+					anyFound = true
+				}
+				if val, err := r.rdb.Get(ctx, fmt.Sprintf("indicators:volume:%s:%s", tf, symbol)).Result(); err == nil {
+					msg.Volume[tf] = json.RawMessage(val)
+					anyFound = true
+				}
+			}
+			if val, err := r.rdb.Get(ctx, fmt.Sprintf("indicators:pressure:%s", symbol)).Result(); err == nil {
+				msg.Pressure = json.RawMessage(val)
+				anyFound = true
+			}
+
+			if !anyFound {
+				// analyzer ещё не публиковал ничего для этого символа
+				// (например, сервис только что запустился) — не шлём
+				// пустое сообщение клиентам.
+				continue
+			}
+
+			// Сравниваем по сериализованному виду — тот же приём, что
+			// в pollStats/pollCandles: дешевле, чем поле-за-полем, и
+			// достаточно надёжно, потому что analyzer сам публикует
+			// с TTL и новым ts на каждый расчётный тик — реально
+			// идентичный JSON означает, что READER просто попал на
+			// тот же самый, ещё не обновившийся снапшот в Redis.
+			raw, err := json.Marshal(msg)
+			if err != nil {
+				continue
+			}
+			if string(raw) == lastRaw {
+				continue
+			}
+			lastRaw = string(raw)
+
+			r.hub.Broadcast(hub.Message{
+				Channel: "indicators",
+				Symbol:  symbol,
+				Data:    msg,
+			})
+		}
+	}
+}
+
 // Balance — структура баланса аккаунта
 type Balance struct {
 	Total    string `json:"total"`
@@ -277,9 +367,9 @@ type ExchangePing struct {
 
 // SystemMsg — служебное сообщение heartbeat от ws-server к TUI
 type SystemMsg struct {
-	ServerTs    int64        `json:"server_ts"`    // timestamp ws-server (для SERV latency)
+	ServerTs     int64        `json:"server_ts"`     // timestamp ws-server (для SERV latency)
 	ExchangePing ExchangePing `json:"exchange_ping"` // латентность биржи current + EMA
-	Balance     Balance      `json:"balance"`       // текущий баланс аккаунта
+	Balance      Balance      `json:"balance"`       // текущий баланс аккаунта
 }
 
 // RunSystem запускает горутину heartbeat — шлёт system сообщение каждые 20s.
@@ -321,9 +411,9 @@ func (r *Reader) broadcastSystem(ctx context.Context) {
 		Channel: "system",
 		Symbol:  "",
 		Data: SystemMsg{
-			ServerTs:    time.Now().UnixMilli(),
+			ServerTs:     time.Now().UnixMilli(),
 			ExchangePing: exchPing,
-			Balance:     balance,
+			Balance:      balance,
 		},
 	})
 }

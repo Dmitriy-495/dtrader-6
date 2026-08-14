@@ -29,7 +29,9 @@ const emaAlpha = 2.0 / (100.0 + 1.0)
 func (c *WSClient) sendPing() error {
 	// Запоминаем момент отправки в миллисекундах — при получении pong
 	// вычтем это значение из времени получения и получим RTT.
-	c.pingTs = time.Now().UnixMilli()
+	// atomic.Int64.Store — см. комментарий у поля pingTs в connection.go,
+	// почему это не обычное присваивание.
+	c.pingTs.Store(time.Now().UnixMilli())
 	return c.writeJSON(WSRequest{
 		Time:    utils.NowUnix(),
 		Channel: "futures.ping",

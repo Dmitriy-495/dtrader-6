@@ -54,6 +54,21 @@ type LocalOrderBook struct {
 	bids   map[float64]bookLevel
 	asks   map[float64]bookLevel
 
+	// depth — глубина, с которой был запрошен ПОСЛЕДНИЙ REST-снапшот
+	// (параметр limit в GetOrderBookSnapshot), НЕ длина bids/asks на
+	// момент создания (биржа теоретически может прислать меньше уровней,
+	// чем запрошено, на низколиквидных парах). Источник истины для
+	// глубины при будущих resync — она должна оставаться постоянной
+	// между вызовами (см. предупреждение в официальной документации
+	// Gate.io о необходимости совпадения depth снапшота и level
+	// подписки). Раньше (найдено независимым аудитом — OpenCode +
+	// Claude Sonnet 5, 2026-08-10) глубина для resync ошибочно бралась
+	// из длины ТЕКУЩЕЙ ВХОДЯЩЕЙ ДЕЛЬТЫ в handleOrderBook (parser.go),
+	// а не из исходного снапшота — дельта обычно содержит лишь
+	// несколько изменившихся уровней, а не полную глубину, из-за чего
+	// пересинхронизация могла "урезать" стакан.
+	depth int
+
 	// lastUpdateID — последний применённый update ID (поле u из дельты,
 	// или id из REST-снапшота, если дельт ещё не было). Следующая
 	// валидная дельта должна иметь U == lastUpdateID + 1 — это и есть
@@ -67,14 +82,26 @@ type LocalOrderBook struct {
 	synced bool
 }
 
+// Depth возвращает глубину, с которой был запрошен исходный REST-снапшот
+// этого стакана — используется вызывающим кодом (parser.go) при
+// пересинхронизации, чтобы запрашивать ТУ ЖЕ глубину заново, а не
+// вычислять её из длины текущей входящей дельты (которая почти всегда
+// намного меньше полной глубины).
+func (lob *LocalOrderBook) Depth() int {
+	return lob.depth
+}
+
 // newLocalOrderBook создаёт локальный стакан из REST-снапшота — это
 // единственный способ его создать, пустого/нулевого стакана не бывает:
-// без базового id дельты нечего накатывать.
-func newLocalOrderBook(symbol string, snap *OrderBookSnapshot) *LocalOrderBook {
+// без базового id дельты нечего накатывать. depth — глубина, с которой
+// РЕАЛЬНО был запрошен этот снапшот (параметр limit в самом REST-вызове,
+// не len(snap.Bids)/len(snap.Asks) — см. комментарий у поля depth выше).
+func newLocalOrderBook(symbol string, snap *OrderBookSnapshot, depth int) *LocalOrderBook {
 	lob := &LocalOrderBook{
 		symbol:       symbol,
 		bids:         make(map[float64]bookLevel, len(snap.Bids)),
 		asks:         make(map[float64]bookLevel, len(snap.Asks)),
+		depth:        depth,
 		lastUpdateID: snap.ID,
 		synced:       false,
 	}
@@ -279,7 +306,7 @@ func (c *WSClient) InitOrderBookSnapshots(ctx context.Context, symbols []string,
 		if err != nil {
 			return fmt.Errorf("orderbook snapshot %s: %w", symbol, err)
 		}
-		c.books[symbol] = newLocalOrderBook(symbol, snap)
+		c.books[symbol] = newLocalOrderBook(symbol, snap, depth)
 		log.Printf("📖 [orderbook] снапшот получен: %s id=%d bids=%d asks=%d",
 			symbol, snap.ID, len(snap.Bids), len(snap.Asks))
 	}
@@ -304,6 +331,16 @@ func (c *WSClient) resyncOrderBook(symbol string, depth int) {
 	}()
 
 	if c.restClient == nil {
+		// В отличие от InitOrderBookSnapshots (которая возвращает явную
+		// ошибку при том же условии) — здесь функция вызывается через
+		// go c.resyncOrderBook(...) и не возвращает ошибку по дизайну
+		// (это fire-and-forget горутина). Раньше эта ветка молчала
+		// вообще без лога — при отладке "почему стакан не восстановился
+		// после разрыва последовательности" разработчик видел бы только
+		// то, что флаг resyncing сброшен, без единого объяснения причины
+		// в логах. Найдено независимым аудитом (OpenCode + Claude
+		// Sonnet 5, 2026-08-10).
+		log.Printf("⚠️ orderbook resync %s пропущен: REST-клиент не задан в WSClient", symbol)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
@@ -315,7 +352,7 @@ func (c *WSClient) resyncOrderBook(symbol string, depth int) {
 		return
 	}
 	c.booksMu.Lock()
-	c.books[symbol] = newLocalOrderBook(symbol, snap)
+	c.books[symbol] = newLocalOrderBook(symbol, snap, depth)
 	c.booksMu.Unlock()
 	log.Printf("🔄 [orderbook] пересинхронизация выполнена: %s id=%d", symbol, snap.ID)
 }

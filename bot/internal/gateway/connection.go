@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Dmitriy-495/dtrader-6/bot/internal/publisher"
 	"github.com/gorilla/websocket"
@@ -29,10 +30,22 @@ type WSClient struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex // защищает conn от одновременной записи из разных горутин
 	pub     *publisher.Publisher
-	done    chan struct{} // закрывается/сигналит, когда соединение разорвано
+	done    chan struct{} // закрывается (НЕ отправляет значение — см. signalDone в ws.go)
 
-	pingTs int64   // timestamp последнего отправленного ping (unix ms) — используется в pingloop.go
-	emaLat float64 // EMA латентности (ms) — используется в pingloop.go
+	// pingTs — timestamp последнего отправленного ping (unix ms).
+	// ПИШЕТСЯ в sendPing (pingloop.go, горутина RunPingLoop), ЧИТАЕТСЯ
+	// при получении pong в ReadLoop (ws.go, ДРУГАЯ горутина) — реальная
+	// гонка данных без синхронизации, комментарий "используется в
+	// pingloop.go" был неточен и вводил в заблуждение (реально читается
+	// из ws.go). Найдено независимым аудитом (OpenCode + Claude Sonnet
+	// 5, 2026-08-11): на amd64/arm64 разрыва значения не будет
+	// (естественно выровненный int64), но без happens-before нет
+	// формальной гарантии видимости актуального значения между
+	// горутинами, и на 32-битных платформах int64 в принципе не
+	// атомарен без sync/atomic. atomic.Int64 устраняет гонку полностью,
+	// без цены дополнительного мьютекса на каждую операцию.
+	pingTs atomic.Int64
+	emaLat float64 // EMA латентности (ms) — пишется и читается только внутри ReadLoop, гонки нет
 
 	// restClient — REST-клиент Gate.io, нужен ТОЛЬКО для одной вещи:
 	// получить снапшот стакана (GetOrderBookSnapshot) при инициализации
@@ -66,6 +79,34 @@ type WSClient struct {
 	// запроса (это оверинжиниринг для сценария "иногда рвётся
 	// последовательность", а не "рвётся постоянно").
 	resyncing map[string]bool
+}
+
+// tryStartResync атомарно проверяет и, если для символа ещё не идёт
+// пересинхронизация, помечает её начатой — возвращает true, если ИМЕННО
+// ЭТОТ вызов получил право запускать resyncOrderBook, false — если для
+// символа уже кто-то другой начал resync и его нужно дождаться.
+//
+// Вынесен в отдельный метод (не инлайн внутри handleOrderBook) по двум
+// причинам, обе — по итогам независимого аудита (OpenCode + Claude
+// Sonnet 5, 2026-08-10):
+//  1. Тестируемость: раньше юнит-тест на защиту от параллельного resync
+//     (TestResyncGuard_PreventsParallelResyncForSameSymbol) копировал эту
+//     логику в теле теста вместо вызова настоящего продакшн-кода — если
+//     бы кто-то сломал guard именно в handleOrderBook, тест продолжил
+//     бы проходить, потому что проверял отдельную, не связанную с
+//     реальным кодом копию той же логики. Теперь тест вызывает этот
+//     метод напрямую — реальный код и тестируемый код гарантированно
+//     совпадают.
+//  2. Явная документация инварианта: почему вообще нужна эта защита — см.
+//     комментарий у поля resyncing выше в этом файле.
+func (c *WSClient) tryStartResync(symbol string) bool {
+	c.booksMu.Lock()
+	defer c.booksMu.Unlock()
+	if c.resyncing[symbol] {
+		return false
+	}
+	c.resyncing[symbol] = true
+	return true
 }
 
 // NewWSClient создаёт новый WS-клиент. Соединение ещё не устанавливается —

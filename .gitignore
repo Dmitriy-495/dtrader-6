@@ -32,3 +32,5 @@ CHECKPOINT_*.md
 
 # Временные архивы
 *.zip
+*.heapsnapshot
+*.heapsnapshot

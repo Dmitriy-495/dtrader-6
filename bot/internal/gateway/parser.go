@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 )
 
 // parseLiquidations разбирает поле Result канала futures.public_liquidates.
@@ -22,10 +23,17 @@ func parseLiquidations(raw json.RawMessage) ([]Liquidation, error) {
 		return liqs, nil
 	}
 	var liq Liquidation
-	if err := json.Unmarshal(raw, &liq); err == nil {
+	err := json.Unmarshal(raw, &liq)
+	if err == nil {
 		return []Liquidation{liq}, nil
 	}
-	return nil, fmt.Errorf("не удалось распарсить ликвидацию")
+	// Оба варианта парсинга не сработали — оборачиваем именно ошибку
+	// разбора как одиночный объект (%w сохраняет её как причину для
+	// errors.Is/errors.As), это более информативный вариант из двух:
+	// массив редко имеет смысл присылать пустым или единственным
+	// элементом, поэтому чаще всего реальная проблема протокола
+	// обнаруживается именно на попытке разбора как объекта.
+	return nil, fmt.Errorf("не удалось распарсить ликвидацию (ни как массив, ни как объект): %w", err)
 }
 
 // handleTrades обрабатывает пакет сделок с канала futures.trades.
@@ -98,30 +106,25 @@ func (c *WSClient) handleOrderBook(ctx context.Context, raw json.RawMessage) {
 
 	if needResync {
 		log.Printf("🔄 [orderbook] обнаружен разрыв последовательности: %s — пересинхронизация", ob.S)
-		// depth берём из фактической глубины уже загруженного снапшота —
-		// столько уровней запросили изначально, столько и запрашиваем
-		// заново, глубина не должна "плавать" между вызовами (см.
-		// предупреждение в официальной документации Gate.io о
-		// необходимости совпадения depth снапшота и level подписки).
-		depth := len(ob.Bids)
-		if depth == 0 {
-			depth = len(ob.Asks)
-		}
+		// depth берём из lob.Depth() — реальной глубины, с которой был
+		// запрошен уже загруженный снапшот (сохранена в LocalOrderBook
+		// при его создании) — столько уровней запросили изначально,
+		// столько и запрашиваем заново, глубина не должна "плавать"
+		// между вызовами (см. предупреждение в официальной документации
+		// Gate.io о необходимости совпадения depth снапшота и level
+		// подписки).
+		//
+		// НЕ путать с len(ob.Bids)/len(ob.Asks) — это длина ТЕКУЩЕЙ
+		// ВХОДЯЩЕЙ ДЕЛЬТЫ (обычно всего несколько изменившихся уровней,
+		// не полная глубина стакана). Именно так этот код был написан
+		// раньше и содержал баг — найдено независимым аудитом
+		// (OpenCode + Claude Sonnet 5, 2026-08-10): подмена переменных
+		// ob (дельта) и lob (загруженный стакан) с похожими именами.
+		depth := lob.Depth()
 
-		// Пока идёт resync (REST-запрос занимает сотни мс), ReadLoop
-		// продолжает получать и обрабатывать следующие дельты на СТАРОМ
-		// c.books[ob.S] — каждая из них снова обнаружит несостыковку и
-		// без этой проверки запускала бы ЕЩЁ ОДИН параллельный
-		// resyncOrderBook на тот же символ (см. комментарий у поля
-		// resyncing в connection.go). Один resync на символ одновременно.
-		c.booksMu.Lock()
-		alreadyResyncing := c.resyncing[ob.S]
-		if !alreadyResyncing {
-			c.resyncing[ob.S] = true
-		}
-		c.booksMu.Unlock()
-
-		if alreadyResyncing {
+		if !c.tryStartResync(ob.S) {
+			// Resync для этого символа уже идёт — не запускаем ещё один
+			// параллельный REST-запрос (см. tryStartResync).
 			return
 		}
 		go c.resyncOrderBook(ob.S, depth)
@@ -144,6 +147,28 @@ func (c *WSClient) handleOrderBook(ctx context.Context, raw json.RawMessage) {
 	}
 }
 
+// parseSymbolFromCandleName извлекает символ из поля Name канала
+// futures.candlesticks. Gate.io шлёт Name в формате
+// "{timeframe}_{symbol}", например "1m_BTC_USDT" — отрезаем префикс
+// таймфрейма до первого "_". Если разделитель не найден — возвращаем
+// name как есть (защита от неожиданного формата, лучше опубликовать
+// под странным, но не пустым символом, чем молча потерять данные).
+//
+// Вынесена в отдельную функцию (не инлайн внутри handleCandles) именно
+// для тестируемости — раньше здесь был захардкоженный name[3:]
+// (предполагал ровно 3 символа префикса, как у "1m_"), который молча
+// ломался бы для таймфреймов с более длинным префиксом ("15m_", "30m_").
+// Найдено независимым аудитом (OpenCode + Claude Sonnet 5, 2026-08-10).
+// Сейчас bot подписывается только на 1m (см. SubscribeCandlesticks в
+// subscribe.go), поэтому баг не проявлялся на практике, но разбор по
+// разделителю устойчив к префиксу любой длины на будущее.
+func parseSymbolFromCandleName(name string) string {
+	if idx := strings.IndexByte(name, '_'); idx >= 0 {
+		return name[idx+1:]
+	}
+	return name
+}
+
 // handleCandles обрабатывает пакет свечей с канала futures.candlesticks.
 // Публикуем только ЗАКРЫТЫЕ свечи (candle.Window == true) — иначе на
 // каждое промежуточное обновление внутри текущей минуты мы бы писали
@@ -156,13 +181,7 @@ func (c *WSClient) handleCandles(ctx context.Context, raw json.RawMessage) {
 	}
 	for _, candle := range candles {
 		if candle.Window && c.pub != nil {
-			// Gate.io шлёт Name в формате "1m_BTC_USDT" (таймфрейм
-			// + символ через подчёркивание). Первые 3 символа ("1m_")
-			// отрезаем, чтобы получить чистый символ "BTC_USDT".
-			symbol := candle.Name
-			if len(symbol) > 3 {
-				symbol = symbol[3:]
-			}
+			symbol := parseSymbolFromCandleName(candle.Name)
 			if err := c.pub.PublishCandle(ctx, symbol, candle); err != nil {
 				log.Printf("⚠️ publish candle failed: symbol=%s err=%v", symbol, err)
 				c.pub.Metrics.IncDropped()
