@@ -127,7 +127,12 @@ func (c *WSClient) handleOrderBook(ctx context.Context, raw json.RawMessage) {
 			// параллельный REST-запрос (см. tryStartResync).
 			return
 		}
-		go c.resyncOrderBook(ob.S, depth)
+		// currentGeneration() захватывается ЗДЕСЬ, до запуска горутины —
+		// это то самое "поколение", относительно которого resyncOrderBook
+		// потом проверит, не успело ли соединение реконнектиться, пока
+		// REST-запрос был в полёте (см. комментарий у поля generation
+		// в connection.go и у самого resyncOrderBook в orderbook.go).
+		go c.resyncOrderBook(ob.S, depth, c.currentGeneration())
 		return
 	}
 

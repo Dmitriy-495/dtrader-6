@@ -74,7 +74,8 @@ func TestParseLiquidations_SingleObjectFormat(t *testing.T) {
 }
 
 // TestParseLiquidations_InvalidJSONWrapsUnderlyingError — регрессионный
-// тест на находку 5.2 независимого аудита: раньше ошибка не оборачивала
+// тест на находку 5.2 первого раунда независимого аудита parser.go
+// (агент OpenCode/Sonnet-5, 2026-08-10): раньше ошибка не оборачивала
 // исходную причину сбоя парсинга (%w отсутствовал), что затрудняло
 // диагностику протокольных изменений Gate.io. Теперь errors.Unwrap
 // должен возвращать исходную ошибку json.Unmarshal, не nil.

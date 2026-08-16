@@ -323,7 +323,16 @@ func (c *WSClient) InitOrderBookSnapshots(ctx context.Context, symbols []string,
 // ДО запуска этой горутины — здесь только гарантированный сброс флага по
 // завершении (через defer), чтобы символ не остался навсегда
 // заблокированным для будущих resync, даже если REST-запрос упал с ошибкой.
-func (c *WSClient) resyncOrderBook(symbol string, depth int) {
+//
+// startGeneration — номер поколения WS-соединения на момент ЗАПУСКА этой
+// горутины (см. комментарий у поля generation в connection.go). Перед
+// записью результата в c.books проверяем, что поколение не изменилось —
+// если main.go успел реконнектиться, пока этот REST-запрос был в полёте,
+// c.books уже содержит свежий стакан от InitOrderBookSnapshots нового
+// соединения, и наш устаревший результат нужно молча отбросить, а НЕ
+// перезаписывать им уже актуальные данные. Найдено независимым аудитом
+// (OpenCode + Claude Sonnet 5, 2026-08-11).
+func (c *WSClient) resyncOrderBook(symbol string, depth int, startGeneration int64) {
 	defer func() {
 		c.booksMu.Lock()
 		delete(c.resyncing, symbol)
@@ -351,7 +360,19 @@ func (c *WSClient) resyncOrderBook(symbol string, depth int) {
 		log.Printf("⚠️ orderbook resync %s failed: %v", symbol, err)
 		return
 	}
+
 	c.booksMu.Lock()
+	if c.currentGeneration() != startGeneration {
+		// Соединение успело реконнектиться, пока мы ждали ответ REST —
+		// наш результат устарел относительно НОВОГО потока дельт.
+		// c.books[symbol] уже содержит свежий стакан от
+		// InitOrderBookSnapshots следующего поколения — не трогаем его.
+		c.booksMu.Unlock()
+		log.Printf("⚠️ orderbook resync %s: результат отброшен — соединение "+
+			"успело реконнектиться (поколение изменилось с %d), id=%d не применён",
+			symbol, startGeneration, snap.ID)
+		return
+	}
 	c.books[symbol] = newLocalOrderBook(symbol, snap, depth)
 	c.booksMu.Unlock()
 	log.Printf("🔄 [orderbook] пересинхронизация выполнена: %s id=%d", symbol, snap.ID)
